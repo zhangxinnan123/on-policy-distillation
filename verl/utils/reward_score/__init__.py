@@ -14,6 +14,7 @@
 # from . import gsm8k, math, prime_math, prime_code
 
 from verl.utils.import_utils import deprecated
+from verl.utils.reward_score import math_dapo
 
 
 def default_compute_score(
@@ -56,10 +57,18 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
-        from . import math_dapo
+    # elif data_source in ["math_dapo", "math", "math_dapo_reasoning"]:
+    #     from . import math_dapo
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+    #     res = math_dapo.compute_score(solution_str, ground_truth)
+    elif data_source.startswith("math_dapo") or data_source.startswith("aime"):
+        from . import math_boxed
+
+        res = math_boxed.compute_score(solution_str, ground_truth)
+        # from . import math_verify
+
+        # res = math_dapo.compute_score(solution_str, ground_truth)
+        
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
