@@ -258,17 +258,37 @@ def distillation_loss(
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
         old_log_prob = data["old_log_probs"]
         rollout_is_weights = data.get("rollout_is_weights", None)
+
+        # Apply advantage-based loss masking: zero out loss at positions where a <= advantage <= b
+        distill_advantages = -distillation_losses.detach()
+        adv_mask_low = config.get("advantage_mask_low", None)
+        adv_mask_high = config.get("advantage_mask_high", None)
+        if adv_mask_low is not None and adv_mask_high is not None:
+            adv_keep = ~((distill_advantages >= adv_mask_low) & (distill_advantages <= adv_mask_high))
+            pg_response_mask = response_mask * adv_keep
+        else:
+            pg_response_mask = response_mask
+
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
-            response_mask=response_mask,
+            advantages=distill_advantages,
+            response_mask=pg_response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
             rollout_is_weights=rollout_is_weights,
         )
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
+
+        # log advantage mask ratio for distillation path
+        if pg_response_mask is not response_mask:
+            total_tokens = response_mask.sum()
+            kept_tokens = pg_response_mask.sum()
+            ratio = (kept_tokens / total_tokens).detach().item() if total_tokens > 0 else 1.0
+            distillation_metrics["distillation/adv_mask_keep_ratio"] = Metric(
+                value=ratio, aggregation=AggregationType.MEAN
+            )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         distillation_loss = agg_loss(
