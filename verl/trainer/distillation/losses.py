@@ -281,13 +281,19 @@ def distillation_loss(
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
 
-        # log advantage mask ratio for distillation path
+        # log advantage mask metrics for distillation path
         if pg_response_mask is not response_mask:
-            total_tokens = response_mask.sum()
-            kept_tokens = pg_response_mask.sum()
-            ratio = (kept_tokens / total_tokens).detach().item() if total_tokens > 0 else 1.0
+            total_tokens = response_mask.sum().detach().item()
+            kept_tokens = pg_response_mask.sum().detach().item()
+            ratio = kept_tokens / total_tokens if total_tokens > 0 else 1.0
             distillation_metrics["distillation/adv_mask_keep_ratio"] = Metric(
                 value=ratio, aggregation=AggregationType.MEAN
+            )
+            distillation_metrics["distillation/adv_mask_total_tokens"] = Metric(
+                value=total_tokens, aggregation=AggregationType.SUM
+            )
+            distillation_metrics["distillation/adv_mask_kept_tokens"] = Metric(
+                value=kept_tokens, aggregation=AggregationType.SUM
             )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
