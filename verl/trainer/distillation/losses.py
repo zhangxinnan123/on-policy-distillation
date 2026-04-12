@@ -202,7 +202,10 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    #### OLD: dp_group was not passed to distillation_loss
+    # distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    ####
+    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data, dp_group)
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
     if not distillation_loss_config.use_task_rewards:
         policy_loss = 0.0
@@ -223,6 +226,7 @@ def distillation_loss(
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
+    dp_group=None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the distillation loss and related metrics.
@@ -266,6 +270,15 @@ def distillation_loss(
         if adv_mask_low is not None and adv_mask_high is not None:
             adv_keep = ~((distill_advantages >= adv_mask_low) & (distill_advantages <= adv_mask_high))
             pg_response_mask = response_mask * adv_keep
+            #### OLD: no batch_num_tokens adjustment — normalizer still used global total
+            #### response tokens (T), causing loss to be scaled down by kept_ratio (K/T).
+            ####
+            # Fix: use all_reduce to get global kept count (K) as the normalizer,
+            # so that effective_loss = global_kept_sum / K (strict global token-mean over kept tokens).
+            global_kept_tokens = pg_response_mask.sum().to(distill_advantages.device)
+            if dp_group is not None:
+                torch.distributed.all_reduce(global_kept_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            loss_config.global_batch_info["batch_num_tokens"] = global_kept_tokens
         else:
             pg_response_mask = response_mask
 
