@@ -280,6 +280,7 @@ def distillation_loss(
         # student already assigns the highest probability to this token, skip it to avoid being
         # overly aggressive. When advantage < 0 (teacher wants to lower the probability), the
         # argmax token should still be updated.
+        pre_argmax_mask = pg_response_mask  # save state before argmax mask for metrics
         if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
             is_argmax = no_padding_2_padding(model_output["is_argmax"], data)
             argmax_to_mask = (distill_advantages > 0) & is_argmax
@@ -321,15 +322,14 @@ def distillation_loss(
                 value=kept_tokens, aggregation=AggregationType.SUM
             )
         if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
-            # Total tokens with positive advantage (within response tokens)
-            total_positive_adv = ((distill_advantages > 0) & response_mask.bool()).sum().detach().item()
-            # Of those, how many are the student's argmax (and thus masked)?
-            argmax_masked = argmax_to_mask.sum().detach().item()
-            argmax_ratio = argmax_masked / total_positive_adv if total_positive_adv > 0 else 0.0
+            # Among high-adv tokens that survived the advantage-range mask, how many are argmax?
+            high_adv_pre_argmax = ((distill_advantages > 0) & pre_argmax_mask.bool()).sum().detach().item()
+            argmax_actually_masked = (argmax_to_mask & pre_argmax_mask.bool()).sum().detach().item()
+            argmax_ratio = argmax_actually_masked / high_adv_pre_argmax if high_adv_pre_argmax > 0 else 0.0
             distillation_metrics["distillation/argmax_mask_count"] = Metric(
-                value=argmax_masked, aggregation=AggregationType.SUM
+                value=argmax_actually_masked, aggregation=AggregationType.SUM
             )
-            distillation_metrics["distillation/argmax_mask_ratio_in_positive_adv"] = Metric(
+            distillation_metrics["distillation/argmax_mask_ratio_in_high_adv"] = Metric(
                 value=argmax_ratio, aggregation=AggregationType.MEAN
             )
     else:
