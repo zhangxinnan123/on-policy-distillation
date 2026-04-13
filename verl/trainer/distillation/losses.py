@@ -322,15 +322,22 @@ def distillation_loss(
                 value=kept_tokens, aggregation=AggregationType.SUM
             )
         if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
-            # Among high-adv tokens that survived the advantage-range mask, how many are argmax?
-            high_adv_pre_argmax = ((distill_advantages > 0) & pre_argmax_mask.bool()).sum().detach().item()
+            # Tokens actually masked by the argmax condition (adv > 0 AND is_argmax AND survived adv-range mask)
             argmax_actually_masked = (argmax_to_mask & pre_argmax_mask.bool()).sum().detach().item()
-            argmax_ratio = argmax_actually_masked / high_adv_pre_argmax if high_adv_pre_argmax > 0 else 0.0
+            # Denominator 1: all tokens that survived the advantage-range mask
+            survived_adv_mask = pre_argmax_mask.sum().detach().item()
+            # Denominator 2: tokens with adv > 0 that survived the advantage-range mask (high-adv tokens)
+            high_adv_survived = ((distill_advantages > 0) & pre_argmax_mask.bool()).sum().detach().item()
+            ratio_in_survived = argmax_actually_masked / survived_adv_mask if survived_adv_mask > 0 else 0.0
+            ratio_in_high_adv = argmax_actually_masked / high_adv_survived if high_adv_survived > 0 else 0.0
             distillation_metrics["distillation/argmax_mask_count"] = Metric(
                 value=argmax_actually_masked, aggregation=AggregationType.SUM
             )
+            distillation_metrics["distillation/argmax_mask_ratio_in_survived"] = Metric(
+                value=ratio_in_survived, aggregation=AggregationType.MEAN
+            )
             distillation_metrics["distillation/argmax_mask_ratio_in_high_adv"] = Metric(
-                value=argmax_ratio, aggregation=AggregationType.MEAN
+                value=ratio_in_high_adv, aggregation=AggregationType.MEAN
             )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
