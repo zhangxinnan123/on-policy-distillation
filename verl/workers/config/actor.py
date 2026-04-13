@@ -165,6 +165,7 @@ class ActorConfig(BaseConfig):
     entropy_coeff: float = 0
     advantage_mask_low: Optional[float] = None  # lower bound 'a': mask loss where a <= advantage <= b
     advantage_mask_high: Optional[float] = None  # upper bound 'b': mask loss where a <= advantage <= b
+    advantage_mask_skip_argmax: bool = False  # skip update when advantage > 0 and token is already student's argmax
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False

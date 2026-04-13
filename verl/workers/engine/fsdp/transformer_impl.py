@@ -1018,12 +1018,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
 
         model_output = {}
+        is_argmax = None  # will be set if logits are available (not fused kernels)
 
         input_ids = micro_batch["input_ids"]
 
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
             temperature_rmpad = output_args["temperature_rmpad"]
+
+            is_argmax_rmpad = None  # will be computed below if logits are available (not fused kernels)
 
             if use_fused_kernels:
                 # temperature is singleton
@@ -1042,6 +1045,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     labels=input_ids_rmpad_rolled,
                     inplace_backward=inplace_backward,
                 )
+
+                # compute is_argmax: whether the sampled token is the student's top-1 prediction
+                with torch.no_grad():
+                    is_argmax_rmpad = (input_ids_rmpad_rolled == logits_rmpad.argmax(dim=-1))
 
                 # compute entropy
                 if calculate_entropy:
@@ -1082,6 +1089,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                if is_argmax_rmpad is not None:
+                    is_argmax_rmpad = gather_outputs_and_unpad(
+                        is_argmax_rmpad,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
@@ -1089,6 +1103,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
                 if calculate_entropy:
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                if is_argmax_rmpad is not None:
+                    is_argmax = torch.nested.nested_tensor_from_jagged(is_argmax_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1118,8 +1134,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+
+                    # compute is_argmax: whether the sampled token is the student's top-1 prediction
+                    with torch.no_grad():
+                        is_argmax_rmpad = (input_ids_rmpad_rolled == logits_rmpad.argmax(dim=-1))
+
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                    is_argmax = torch.nested.nested_tensor_from_jagged(is_argmax_rmpad, cu_seqlens)
                     if calculate_entropy:
                         entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
                         entropy_rmpad = torch.cat([t for t in entropy.unbind()])
@@ -1128,6 +1150,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         model_output["log_probs"] = log_probs
+        if is_argmax is not None:
+            model_output["is_argmax"] = is_argmax
         if calculate_entropy:
             model_output["entropy"] = entropy
 
