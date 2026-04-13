@@ -202,7 +202,10 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    #### OLD: dp_group was not passed to distillation_loss
+    # distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    ####
+    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data, dp_group)
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
     if not distillation_loss_config.use_task_rewards:
         policy_loss = 0.0
@@ -223,6 +226,7 @@ def distillation_loss(
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
+    dp_group=None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the distillation loss and related metrics.
@@ -258,17 +262,52 @@ def distillation_loss(
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
         old_log_prob = data["old_log_probs"]
         rollout_is_weights = data.get("rollout_is_weights", None)
+
+        # Apply advantage-based loss masking: zero out loss at positions where a <= advantage <= b
+        distill_advantages = -distillation_losses.detach()
+        adv_mask_low = config.get("advantage_mask_low", None)
+        adv_mask_high = config.get("advantage_mask_high", None)
+        if adv_mask_low is not None and adv_mask_high is not None:
+            adv_keep = ~((distill_advantages >= adv_mask_low) & (distill_advantages <= adv_mask_high))
+            pg_response_mask = response_mask * adv_keep
+            #### OLD: no batch_num_tokens adjustment — normalizer still used global total
+            #### response tokens (T), causing loss to be scaled down by kept_ratio (K/T).
+            ####
+            # Fix: use all_reduce to get global kept count (K) as the normalizer,
+            # so that effective_loss = global_kept_sum / K (strict global token-mean over kept tokens).
+            global_kept_tokens = pg_response_mask.sum().to(distill_advantages.device)
+            if dp_group is not None:
+                torch.distributed.all_reduce(global_kept_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            loss_config.global_batch_info["batch_num_tokens"] = global_kept_tokens
+        else:
+            pg_response_mask = response_mask
+
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
-            response_mask=response_mask,
+            advantages=distill_advantages,
+            response_mask=pg_response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
             rollout_is_weights=rollout_is_weights,
         )
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
+
+        # log advantage mask metrics for distillation path
+        if pg_response_mask is not response_mask:
+            total_tokens = response_mask.sum().detach().item()
+            kept_tokens = pg_response_mask.sum().detach().item()
+            ratio = kept_tokens / total_tokens if total_tokens > 0 else 1.0
+            distillation_metrics["distillation/adv_mask_keep_ratio"] = Metric(
+                value=ratio, aggregation=AggregationType.MEAN
+            )
+            distillation_metrics["distillation/adv_mask_total_tokens"] = Metric(
+                value=total_tokens, aggregation=AggregationType.SUM
+            )
+            distillation_metrics["distillation/adv_mask_kept_tokens"] = Metric(
+                value=kept_tokens, aggregation=AggregationType.SUM
+            )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         distillation_loss = agg_loss(
