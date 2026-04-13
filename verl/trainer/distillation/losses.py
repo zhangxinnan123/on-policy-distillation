@@ -321,9 +321,16 @@ def distillation_loss(
                 value=kept_tokens, aggregation=AggregationType.SUM
             )
         if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
+            # Total tokens with positive advantage (within response tokens)
+            total_positive_adv = ((distill_advantages > 0) & response_mask.bool()).sum().detach().item()
+            # Of those, how many are the student's argmax (and thus masked)?
             argmax_masked = argmax_to_mask.sum().detach().item()
+            argmax_ratio = argmax_masked / total_positive_adv if total_positive_adv > 0 else 0.0
             distillation_metrics["distillation/argmax_mask_count"] = Metric(
                 value=argmax_masked, aggregation=AggregationType.SUM
+            )
+            distillation_metrics["distillation/argmax_mask_ratio_in_positive_adv"] = Metric(
+                value=argmax_ratio, aggregation=AggregationType.MEAN
             )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
