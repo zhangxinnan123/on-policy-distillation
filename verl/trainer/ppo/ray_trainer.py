@@ -531,6 +531,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_complete = []  # 1.0 if generation ended with EOS, else 0.0
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -585,6 +586,14 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+
+            # Check if each response ends with the EOS token (complete generation)
+            response_mask = test_output_gen_batch.batch["response_mask"]
+            resp_lengths = response_mask.sum(dim=-1)  # (B,)
+            last_idx = (resp_lengths - 1).clamp(min=0).long()
+            last_tokens = output_ids[torch.arange(output_ids.size(0), device=output_ids.device), last_idx]
+            is_complete = (last_tokens == self.tokenizer.eos_token_id) & (resp_lengths > 0)
+            sample_complete.extend(is_complete.float().cpu().tolist())
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -643,7 +652,10 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        val_metrics = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        if sample_complete:
+            val_metrics["val/response/complete_ratio"] = sum(sample_complete) / len(sample_complete)
+        return val_metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -1642,7 +1654,7 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, eos_token_id=self.tokenizer.eos_token_id))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

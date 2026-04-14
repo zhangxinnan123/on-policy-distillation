@@ -83,7 +83,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = True, eos_token_id: int | None = None) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -211,6 +211,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    # complete generation: last real token of each non-aborted response is the EOS token
+    if eos_token_id is not None:
+        responses = batch.batch["responses"]  # (B, max_response_length)
+        # index of the last non-padding token per sample (clamped so aborted=0 samples point to index 0)
+        last_idx = (response_length - 1).clamp(min=0).long()
+        last_tokens = responses[torch.arange(responses.size(0), device=responses.device), last_idx]
+        is_complete = (last_tokens == eos_token_id) & non_aborted_mask
+        complete_ratio = is_complete.float().mean().detach().item()
+        non_aborted_complete_ratio = (
+            is_complete[non_aborted_mask].float().mean().detach().item()
+            if non_aborted_mask.any()
+            else 0.0
+        )
+        metrics["response/complete_ratio"] = complete_ratio
+        metrics["response/complete_ratio_non_aborted"] = non_aborted_complete_ratio
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

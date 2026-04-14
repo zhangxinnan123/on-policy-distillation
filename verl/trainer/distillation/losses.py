@@ -270,6 +270,43 @@ def distillation_loss(
 
         adv_mask_low = config.get("advantage_mask_low", None)
         adv_mask_high = config.get("advantage_mask_high", None)
+        adv_mask_percent = config.get("advantage_mask_percent", None)
+
+        if adv_mask_percent is not None:
+            # Derive low/high from exact global percentiles across all DP ranks.
+            # e.g. adv_mask_percent=0.9 → keep bottom 5% and top 5%, mask middle 90%.
+            tail = (1.0 - adv_mask_percent) / 2.0  # 0.05 for 90%
+            valid_advs = distill_advantages[response_mask.bool()].float()  # only response tokens
+
+            if dp_group is not None:
+                world_size = torch.distributed.get_world_size(dp_group)
+
+                # Step 1: share local sizes so every rank knows each rank's contribution
+                local_size = torch.tensor([valid_advs.numel()], device=valid_advs.device)
+                all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+                torch.distributed.all_gather(all_sizes, local_size, group=dp_group)
+                all_sizes = [s.item() for s in all_sizes]
+
+                # Step 2: pad to max size so all_gather receives equal-shaped tensors
+                max_size = max(all_sizes)
+                padded = torch.nn.functional.pad(valid_advs, (0, max_size - valid_advs.numel()))
+
+                # Step 3: all_gather padded tensors
+                gathered = [torch.zeros(max_size, dtype=padded.dtype, device=padded.device)
+                            for _ in range(world_size)]
+                torch.distributed.all_gather(gathered, padded, group=dp_group)
+
+                # Step 4: strip padding from each rank's slice then concatenate
+                all_advs = torch.cat([t[:s] for t, s in zip(gathered, all_sizes)])
+            else:
+                all_advs = valid_advs
+
+            if all_advs.numel() > 0:
+                adv_mask_low = torch.quantile(all_advs, tail).item()
+                adv_mask_high = torch.quantile(all_advs, 1.0 - tail).item()
+            else:
+                adv_mask_low = adv_mask_high = None
+
         if adv_mask_low is not None and adv_mask_high is not None:
             adv_keep = ~((distill_advantages >= adv_mask_low) & (distill_advantages <= adv_mask_high))
             pg_response_mask = pg_response_mask * adv_keep
@@ -321,6 +358,13 @@ def distillation_loss(
             distillation_metrics["distillation/adv_mask_kept_tokens"] = Metric(
                 value=kept_tokens, aggregation=AggregationType.SUM
             )
+            if adv_mask_low is not None and adv_mask_high is not None:
+                distillation_metrics["distillation/adv_mask_low"] = Metric(
+                    value=adv_mask_low, aggregation=AggregationType.MEAN
+                )
+                distillation_metrics["distillation/adv_mask_high"] = Metric(
+                    value=adv_mask_high, aggregation=AggregationType.MEAN
+                )
         if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
             # Tokens actually masked by the argmax condition (adv > 0 AND is_argmax AND survived adv-range mask)
             argmax_actually_masked = (argmax_to_mask & pre_argmax_mask.bool()).sum().detach().item()

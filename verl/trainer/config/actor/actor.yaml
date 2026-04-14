@@ -88,6 +88,18 @@ loss_scale_factor: null
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Lower bound for advantage-based loss masking: zero out loss where low <= advantage <= high
+advantage_mask_low: null
+
+# Upper bound for advantage-based loss masking: zero out loss where low <= advantage <= high
+advantage_mask_high: null
+
+# Percentile-based advantage mask: e.g. 0.9 masks the middle 90% (5th-95th pct). Overrides low/high when set.
+advantage_mask_percent: null
+
+# Skip update when advantage > 0 and token is already the student's argmax
+advantage_mask_skip_argmax: false
+
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false
 
