@@ -41,7 +41,7 @@ SP=1
 
 ## advantage clip
 advantage_mask_low=-0.5
-advantage_mask_high=0.1
+advantage_mask_high=0.05
 
 EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/pg-${USE_POLICY_GRADIENT}/adv_mask-${advantage_mask_low}_${advantage_mask_high}"
 
