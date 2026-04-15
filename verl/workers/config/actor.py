@@ -165,6 +165,8 @@ class ActorConfig(BaseConfig):
     entropy_coeff: float = 0
     advantage_mask_low: Optional[float] = None  # lower bound 'a': mask loss where a <= advantage <= b
     advantage_mask_high: Optional[float] = None  # upper bound 'b': mask loss where a <= advantage <= b
+    advantage_mask_skip_argmax: bool = False  # skip update when advantage > 0 and token is already student's argmax
+    advantage_mask_norm: str = "all"  # "all": normalize by all response tokens; "kept": normalize by kept tokens only
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
@@ -218,6 +220,26 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        # validate advantage masking config
+        if (self.advantage_mask_low is None) != (self.advantage_mask_high is None):
+            raise ValueError(
+                "[actor] advantage_mask_low and advantage_mask_high must both be set or both be None, "
+                f"got advantage_mask_low={self.advantage_mask_low}, advantage_mask_high={self.advantage_mask_high}."
+            )
+        if (
+            self.advantage_mask_low is not None
+            and self.advantage_mask_high is not None
+            and self.advantage_mask_low > self.advantage_mask_high
+        ):
+            raise ValueError(
+                f"[actor] advantage_mask_low ({self.advantage_mask_low}) must be <= "
+                f"advantage_mask_high ({self.advantage_mask_high})."
+            )
+        if self.advantage_mask_norm not in ("all", "kept"):
+            raise ValueError(
+                f"[actor] advantage_mask_norm must be 'all' or 'kept', got '{self.advantage_mask_norm}'."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

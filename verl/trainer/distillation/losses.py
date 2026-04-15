@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -24,6 +25,9 @@ from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
+
+# module-level flag so the argmax-mask warning is only emitted once per process
+_ARGMAX_MASK_NO_OP_WARNED = False
 
 DistillationLossFn = Callable[
     [
@@ -254,33 +258,73 @@ def distillation_loss(
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
+    # Populate global batch info directly from data (rather than relying on
+    # ppo_loss to set config.global_batch_info, which runs AFTER distillation_loss
+    # in distillation_ppo_loss — for the first call, that dict would be empty
+    # and agg_loss would fall back to local mask sum on each rank).
+    loss_config.global_batch_info["dp_size"] = data["dp_size"]
+    loss_config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    loss_config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    loss_config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
-        for k, v in config.global_batch_info.items():
-            loss_config.global_batch_info[k] = v
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
         old_log_prob = data["old_log_probs"]
         rollout_is_weights = data.get("rollout_is_weights", None)
 
         # Apply advantage-based loss masking: zero out loss at positions where a <= advantage <= b
         distill_advantages = -distillation_losses.detach()
+        pg_response_mask = response_mask
+        masks_applied = False
+
         adv_mask_low = config.get("advantage_mask_low", None)
         adv_mask_high = config.get("advantage_mask_high", None)
         if adv_mask_low is not None and adv_mask_high is not None:
             adv_keep = ~((distill_advantages >= adv_mask_low) & (distill_advantages <= adv_mask_high))
-            pg_response_mask = response_mask * adv_keep
-            #### OLD: no batch_num_tokens adjustment — normalizer still used global total
-            #### response tokens (T), causing loss to be scaled down by kept_ratio (K/T).
-            ####
-            # Fix: use all_reduce to get global kept count (K) as the normalizer,
-            # so that effective_loss = global_kept_sum / K (strict global token-mean over kept tokens).
+            pg_response_mask = pg_response_mask * adv_keep
+            masks_applied = True
+
+        # Apply argmax mask: skip update when advantage > 0 and token is already student's argmax.
+        # When advantage > 0, the teacher wants to push the token probability higher, but if the
+        # student already assigns the highest probability to this token, skip it to avoid being
+        # overly aggressive. When advantage < 0 (teacher wants to lower the probability), the
+        # argmax token should still be updated.
+        pre_argmax_mask = pg_response_mask  # save state before argmax mask for metrics
+        argmax_skip_requested = config.get("advantage_mask_skip_argmax", False)
+        argmax_available = "is_argmax" in model_output
+        if argmax_skip_requested and argmax_available:
+            is_argmax = no_padding_2_padding(model_output["is_argmax"], data)
+            argmax_to_mask = (distill_advantages > 0) & is_argmax
+            pg_response_mask = pg_response_mask * ~argmax_to_mask
+            masks_applied = True
+        elif argmax_skip_requested and not argmax_available:
+            # `is_argmax` is not produced when use_fused_kernels=True (FSDP) or under the
+            # Megatron backend. In that case the argmax mask silently has no effect, which
+            # is easy to miss — emit a one-time warning so users notice.
+            global _ARGMAX_MASK_NO_OP_WARNED
+            if not _ARGMAX_MASK_NO_OP_WARNED:
+                _ARGMAX_MASK_NO_OP_WARNED = True
+                warnings.warn(
+                    "advantage_mask_skip_argmax=True but model_output has no 'is_argmax' tensor. "
+                    "This typically means use_fused_kernels=True or the Megatron backend is in use, "
+                    "neither of which currently materializes full logits. The argmax mask will be a no-op. "
+                    "Set use_fused_kernels=False (FSDP) or do not enable advantage_mask_skip_argmax.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        # Adjust normalizer based on advantage_mask_norm setting:
+        #   "kept": normalize by kept tokens only (larger per-token loss, larger grad norm)
+        #   "all":  normalize by all response tokens (same scale as no masking)
+        if masks_applied and config.get("advantage_mask_norm", "all") == "kept":
             global_kept_tokens = pg_response_mask.sum().to(distill_advantages.device)
             if dp_group is not None:
                 torch.distributed.all_reduce(global_kept_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            # guard against 0/0 = NaN if every token in this microbatch is masked globally
+            global_kept_tokens = torch.clamp(global_kept_tokens, min=1)
             loss_config.global_batch_info["batch_num_tokens"] = global_kept_tokens
-        else:
-            pg_response_mask = response_mask
 
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
@@ -294,8 +338,8 @@ def distillation_loss(
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
 
-        # log advantage mask metrics for distillation path
-        if pg_response_mask is not response_mask:
+        # log mask metrics for distillation path
+        if masks_applied:
             total_tokens = response_mask.sum().detach().item()
             kept_tokens = pg_response_mask.sum().detach().item()
             ratio = kept_tokens / total_tokens if total_tokens > 0 else 1.0
@@ -308,13 +352,31 @@ def distillation_loss(
             distillation_metrics["distillation/adv_mask_kept_tokens"] = Metric(
                 value=kept_tokens, aggregation=AggregationType.SUM
             )
+        if config.get("advantage_mask_skip_argmax", False) and "is_argmax" in model_output:
+            # Tokens actually masked by the argmax condition (adv > 0 AND is_argmax AND survived adv-range mask)
+            argmax_actually_masked = (argmax_to_mask & pre_argmax_mask.bool()).sum().detach().item()
+            # Denominator 1: all tokens that survived the advantage-range mask
+            survived_adv_mask = pre_argmax_mask.sum().detach().item()
+            # Denominator 2: tokens with adv > 0 that survived the advantage-range mask (high-adv tokens)
+            high_adv_survived = ((distill_advantages > 0) & pre_argmax_mask.bool()).sum().detach().item()
+            ratio_in_survived = argmax_actually_masked / survived_adv_mask if survived_adv_mask > 0 else 0.0
+            ratio_in_high_adv = argmax_actually_masked / high_adv_survived if high_adv_survived > 0 else 0.0
+            distillation_metrics["distillation/argmax_mask_count"] = Metric(
+                value=argmax_actually_masked, aggregation=AggregationType.SUM
+            )
+            distillation_metrics["distillation/argmax_mask_ratio_in_survived"] = Metric(
+                value=ratio_in_survived, aggregation=AggregationType.MEAN
+            )
+            distillation_metrics["distillation/argmax_mask_ratio_in_high_adv"] = Metric(
+                value=ratio_in_high_adv, aggregation=AggregationType.MEAN
+            )
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
-            **config.global_batch_info,
+            **loss_config.global_batch_info,
         )
 
     return distillation_loss, distillation_metrics
