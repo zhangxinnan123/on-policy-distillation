@@ -135,11 +135,15 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         case "fsdp":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if loss_mode == "k1_topk_overlap":
+                distillation_loss_fn = fsdp_losses.compute_student_topk_overlap_k1
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
@@ -458,10 +462,67 @@ def compute_forward_kl_topk(
         "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
     }
 
+    # Per-j overlap diagnostics stored by the logits processor.
+    topk = distillation_config.distillation_loss.topk
+    j = 1
+    while True:
+        for prefix in ("student_mass_at_", "teacher_mass_at_", "overlap_ratio_at_"):
+            key = f"{prefix}{j}"
+            if key in model_output:
+                vals = no_padding_2_padding(model_output[key], data)
+                distillation_metrics[f"distillation/{key}"] = Metric(
+                    AggregationType.MEAN, vals[response_mask_bool].mean()
+                )
+        if j >= topk:
+            break
+        j = min(j * 2, topk)
+
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["k1_topk_overlap"], use_topk=True))  # type: ignore[arg-type]
+def compute_k1_topk_overlap(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """k1 loss with top-k overlap diagnostics.
+
+    Loss: k1 single-sample KL estimator using teacher_next_token_logprobs.
+    Metrics: per-j student/teacher mass and symmetric overlap ratio, computed
+             in the logits processor via compute_student_topk_overlap_k1.
+    """
+
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(data["teacher_next_token_logprobs"], data)
+    response_mask_bool = data["response_mask"].bool()
+    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+
+    distillation_losses = kl_penalty(
+        logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty="k1"
+    )
+    metrics: dict[str, Any] = {
+        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+    }
+
+    # Read overlap diagnostics stored by compute_student_topk_overlap_k1 in the logits processor.
+    topk = distillation_config.distillation_loss.topk
+    j = 1
+    while True:
+        for prefix in ("student_mass_at_", "teacher_mass_at_", "overlap_ratio_at_"):
+            key = f"{prefix}{j}"
+            if key in model_output:
+                vals = no_padding_2_padding(model_output[key], data)
+                metrics[f"distillation/{key}"] = Metric(AggregationType.MEAN, vals[response_mask_bool].mean())
+        if j >= topk:
+            break
+        j = min(j * 2, topk)
+
+    return distillation_losses, metrics
 
 
 @register_distillation_loss(
