@@ -400,31 +400,40 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
         return
 
     prompt_logprobs_ls, prompt_ids_ls = [], []
+    next_token_logprobs_ls = []
     # NOTE: logprob of first prompt token is None.
-    for logprobs_dict in output.prompt_logprobs[1:]:
+    for i, logprobs_dict in enumerate(output.prompt_logprobs[1:]):
+        actual_token_id = output.prompt_token_ids[i + 1]
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob
             prompt_logprobs_ls.append([logprob])
             prompt_ids_ls.append([int(token_id_str)])
+            next_token_logprobs_ls.append(logprob)
         else:
             prompt_ids = [None] * num_prompt_logprobs
             prompt_logprobs = [None] * num_prompt_logprobs
-            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
+            # We get either top-k logprobs or top-k plus the actual token (if not in top-k)
             assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+            next_token_logprob = None
             for token_id_str, token_logprob in logprobs_dict.items():
                 rank = token_logprob.rank
+                tok_id = int(token_id_str)
+                if tok_id == actual_token_id:
+                    next_token_logprob = token_logprob.logprob
                 if rank > num_prompt_logprobs:
-                    continue  # the sampled token is not in the top-k
-                logprob = token_logprob.logprob
-                prompt_ids[rank - 1] = int(token_id_str)
-                prompt_logprobs[rank - 1] = logprob
+                    continue  # actual token outside top-k, skip for top-k arrays
+                prompt_ids[rank - 1] = tok_id
+                prompt_logprobs[rank - 1] = token_logprob.logprob
             prompt_logprobs_ls.append(prompt_logprobs)
             prompt_ids_ls.append(prompt_ids)
+            next_token_logprobs_ls.append(next_token_logprob)
 
     # NOTE: pad a dummy prompt logprob for last prompt token.
     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+    next_token_logprobs_ls.append(0.0)
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    result_dict["prompt_next_token_logprobs"] = next_token_logprobs_ls

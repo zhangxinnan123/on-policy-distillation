@@ -73,4 +73,115 @@ def compute_forward_kl_topk(
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
 
-    return {"distillation_losses": distillation_losses, "student_mass": student_mass, "teacher_mass": teacher_mass}
+    outputs = {"distillation_losses": distillation_losses, "student_mass": student_mass, "teacher_mass": teacher_mass}
+
+    # 3. per-j overlap diagnostics (no_grad — diagnostic only, no activations retained)
+    with torch.no_grad():
+        topk = teacher_topk_ids.shape[-1]
+        T_CHUNK = 4096
+        T_total = student_logits.shape[1]
+        if T_total <= T_CHUNK:
+            _, student_topk_ids = student_logits.topk(topk, dim=-1)
+        else:
+            parts = []
+            for i in range(0, T_total, T_CHUNK):
+                _, idx_i = student_logits[:, i : i + T_CHUNK].topk(topk, dim=-1)
+                parts.append(idx_i)
+            student_topk_ids = torch.cat(parts, dim=1)
+
+        student_probs_at_teacher = student_topk_log_probs.detach().exp()
+        teacher_probs_topk = teacher_topk_log_probs.exp()
+        for j in _overlap_thresholds(topk):
+            outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
+            outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
+            s_j = student_topk_ids[..., :j]
+            t_j_sorted, _ = teacher_topk_ids[..., :j].sort(dim=-1)
+            pos = torch.searchsorted(t_j_sorted, s_j).clamp(max=j - 1)
+            in_set = t_j_sorted.gather(-1, pos) == s_j
+            outputs[f"overlap_ratio_at_{j}"] = in_set.float().sum(dim=-1) / j
+
+    return outputs
+
+
+
+
+def _overlap_thresholds(topk: int) -> list[int]:
+    """[1, 2, 4, 8, ...] up to topk, with topk always appended once."""
+    out: list[int] = [1]
+    j = 2
+    while j < topk:
+        out.append(j)
+        j *= 2
+    if topk != out[-1]:
+        out.append(topk)
+    return out
+
+
+def compute_student_topk_overlap_k1(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Per-j top-k diagnostics. Memory stays within compute_forward_kl_topk's envelope.
+
+    For each j in {1, 2, 4, ..., topk} emits:
+      - student_mass_at_{j}:   Σ p_student(v) for v in teacher top-j
+      - teacher_mass_at_{j}:   Σ p_teacher(v) for v in teacher top-j (cumulative cdf)
+      - overlap_ratio_at_{j}:  symmetric |student top-j ∩ teacher top-j| / j
+
+    The k1 loss itself is computed in the outer registered loss fn.
+
+    Memory notes:
+      - `.topk` on the vocab dim is chunked along T so its scratch never exceeds
+        what forward_kl_topk's log_softmax allocates.
+      - Overlap uses `searchsorted` (O(T·j) memory) rather than the full pairwise
+        bool (O(T·j²)).
+    """
+    del config, data_format  # unused; signature kept for backend-parity
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+
+    # All overlap/mass diagnostics are gradient-free — no activations need to be retained.
+    with torch.no_grad():
+        teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, topk)
+        teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0).long()  # (1, total_nnz, topk)
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+            teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+        assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+        topk = teacher_topk_ids.shape[-1]
+
+        # Student top-k ids via chunked topk on raw logits (monotonic with softmax).
+        T_CHUNK = 4096
+        T_total = student_logits.shape[1]
+        if T_total <= T_CHUNK:
+            _, student_topk_ids = student_logits.topk(topk, dim=-1)
+        else:
+            parts = []
+            for i in range(0, T_total, T_CHUNK):
+                _, idx_i = student_logits[:, i : i + T_CHUNK].topk(topk, dim=-1)
+                parts.append(idx_i)
+            student_topk_ids = torch.cat(parts, dim=1)
+
+        # Mass diagnostics — log_softmax over full vocab, freed immediately after gather.
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        student_log_probs_at_teacher = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+        del student_log_probs  # free (1, T, V)
+        student_probs_at_teacher = student_log_probs_at_teacher.exp()
+        teacher_probs_topk = teacher_topk_log_probs.exp()
+
+        outputs: dict[str, torch.Tensor] = {}
+        for j in _overlap_thresholds(topk):
+            outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
+            outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
+
+            # Symmetric top-j overlap via binary search — avoids the (1, T, j, j) bool.
+            s_j = student_topk_ids[..., :j]
+            t_j_sorted, _ = teacher_topk_ids[..., :j].sort(dim=-1)
+            pos = torch.searchsorted(t_j_sorted, s_j).clamp(max=j - 1)
+            in_set = t_j_sorted.gather(-1, pos) == s_j
+            outputs[f"overlap_ratio_at_{j}"] = in_set.float().sum(dim=-1) / j
+
+    return outputs

@@ -47,19 +47,22 @@ def _get_teacher_sampling_params(
 def _pad_teacher_outputs(
     teacher_ids: torch.Tensor,
     teacher_logprobs: torch.Tensor,
+    teacher_next_token_logprobs: torch.Tensor,
     prompt_width: int,
     response_width: int,
     prompt_length: int,
     response_length: int,
     pad_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # TODO(wuxibin): remove padding and use tensordict.
     left_pad_size = prompt_width - prompt_length
     right_pad_size = response_width - response_length
-    padding = (0, 0, left_pad_size, right_pad_size)
+    padding_2d = (0, 0, left_pad_size, right_pad_size)  # for (S, K) tensors
+    padding_1d = (left_pad_size, right_pad_size)  # for (S,) tensor
     return (
-        F.pad(teacher_ids, padding, value=pad_token_id).unsqueeze(0),
-        F.pad(teacher_logprobs, padding, value=0.0).unsqueeze(0),
+        F.pad(teacher_ids, padding_2d, value=pad_token_id).unsqueeze(0),
+        F.pad(teacher_logprobs, padding_2d, value=0.0).unsqueeze(0),
+        F.pad(teacher_next_token_logprobs, padding_1d, value=0.0).unsqueeze(0),
     )
 
 
@@ -108,7 +111,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         self,
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_output = await self.generate(
@@ -118,12 +121,13 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
         )
-        # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
-        # the distillation loss settings.
+        # Shapes: (S, K) where S is sequence length, K is 1 or topk
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
-        return teacher_ids, teacher_logprobs
+        # Shape: (S,) — teacher logprob for the actual next token at each position
+        teacher_next_token_logprobs = torch.tensor(teacher_output.extra_fields["prompt_next_token_logprobs"])
+        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == teacher_next_token_logprobs.shape[0] == len(sequence_ids)
+        return teacher_ids, teacher_logprobs, teacher_next_token_logprobs
 
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
@@ -149,13 +153,17 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             )
         outputs = await asyncio.gather(*tasks)
 
-        # Pad the teacher logprobs and ids
+        # Pad the teacher logprobs, ids, and next-token logprobs
         padded_teacher_ids = []
         padded_teacher_logprobs = []
-        for (teacher_ids, teacher_logprobs), (prompt_length, response_length) in zip(outputs, lengths, strict=True):
-            padded_ids, padded_logprobs = _pad_teacher_outputs(
+        padded_teacher_next_token_logprobs = []
+        for (teacher_ids, teacher_logprobs, teacher_next_token_logprobs), (prompt_length, response_length) in zip(
+            outputs, lengths, strict=True
+        ):
+            padded_ids, padded_logprobs, padded_next_token_logprobs = _pad_teacher_outputs(
                 teacher_ids,
                 teacher_logprobs,
+                teacher_next_token_logprobs,
                 prompt_width=prompt_width,
                 response_width=response_width,
                 prompt_length=prompt_length,
@@ -164,11 +172,13 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             )
             padded_teacher_ids.append(padded_ids)
             padded_teacher_logprobs.append(padded_logprobs)
+            padded_teacher_next_token_logprobs.append(padded_next_token_logprobs)
 
         batch = TensorDict(
             {
                 "teacher_ids": torch.cat(padded_teacher_ids),
                 "teacher_logprobs": torch.cat(padded_teacher_logprobs),
+                "teacher_next_token_logprobs": torch.cat(padded_teacher_next_token_logprobs),
             },
             batch_size=len(data),
         )
