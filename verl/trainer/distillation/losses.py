@@ -466,7 +466,13 @@ def compute_forward_kl_topk(
     topk = distillation_config.distillation_loss.topk
     j = 1
     while True:
-        for prefix in ("student_mass_at_", "teacher_mass_at_", "overlap_ratio_at_"):
+        for prefix in (
+            "student_mass_at_",
+            "teacher_mass_at_",
+            "overlap_ratio_at_",
+            "overlap_student_mass_at_",
+            "overlap_teacher_mass_at_",
+        ):
             key = f"{prefix}{j}"
             if key in model_output:
                 vals = no_padding_2_padding(model_output[key], data)
@@ -513,7 +519,13 @@ def compute_k1_topk_overlap(
     topk = distillation_config.distillation_loss.topk
     j = 1
     while True:
-        for prefix in ("student_mass_at_", "teacher_mass_at_", "overlap_ratio_at_"):
+        for prefix in (
+            "student_mass_at_",
+            "teacher_mass_at_",
+            "overlap_ratio_at_",
+            "overlap_student_mass_at_",
+            "overlap_teacher_mass_at_",
+        ):
             key = f"{prefix}{j}"
             if key in model_output:
                 vals = no_padding_2_padding(model_output[key], data)

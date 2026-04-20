@@ -91,14 +91,21 @@ def compute_forward_kl_topk(
 
         student_probs_at_teacher = student_topk_log_probs.detach().exp()
         teacher_probs_topk = teacher_topk_log_probs.exp()
+        # Student probs at student's own top-k ids, for mass-weighted overlap.
+        student_probs_at_student = torch.gather(student_log_probs, dim=-1, index=student_topk_ids).exp()
         for j in _overlap_thresholds(topk):
             outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
             outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
             s_j = student_topk_ids[..., :j]
-            t_j_sorted, _ = teacher_topk_ids[..., :j].sort(dim=-1)
+            t_j_sorted, sort_idx = teacher_topk_ids[..., :j].sort(dim=-1)
+            teacher_lp_sorted_j = teacher_topk_log_probs[..., :j].gather(-1, sort_idx)
             pos = torch.searchsorted(t_j_sorted, s_j).clamp(max=j - 1)
             in_set = t_j_sorted.gather(-1, pos) == s_j
-            outputs[f"overlap_ratio_at_{j}"] = in_set.float().sum(dim=-1) / j
+            in_set_f = in_set.float()
+            outputs[f"overlap_ratio_at_{j}"] = in_set_f.sum(dim=-1) / j
+            outputs[f"overlap_student_mass_at_{j}"] = (student_probs_at_student[..., :j] * in_set_f).sum(dim=-1)
+            teacher_prob_at_s = teacher_lp_sorted_j.gather(-1, pos).exp()
+            outputs[f"overlap_teacher_mass_at_{j}"] = (teacher_prob_at_s * in_set_f).sum(dim=-1)
 
     return outputs
 
@@ -127,9 +134,11 @@ def compute_student_topk_overlap_k1(
     """Per-j top-k diagnostics. Memory stays within compute_forward_kl_topk's envelope.
 
     For each j in {1, 2, 4, ..., topk} emits:
-      - student_mass_at_{j}:   Σ p_student(v) for v in teacher top-j
-      - teacher_mass_at_{j}:   Σ p_teacher(v) for v in teacher top-j (cumulative cdf)
-      - overlap_ratio_at_{j}:  symmetric |student top-j ∩ teacher top-j| / j
+      - student_mass_at_{j}:          Σ p_student(v) for v in teacher top-j
+      - teacher_mass_at_{j}:          Σ p_teacher(v) for v in teacher top-j (cumulative cdf)
+      - overlap_ratio_at_{j}:         symmetric |student top-j ∩ teacher top-j| / j
+      - overlap_student_mass_at_{j}:  Σ p_student(v) for v in (student top-j ∩ teacher top-j)
+      - overlap_teacher_mass_at_{j}:  Σ p_teacher(v) for v in (student top-j ∩ teacher top-j)
 
     The k1 loss itself is computed in the outer registered loss fn.
 
@@ -168,8 +177,10 @@ def compute_student_topk_overlap_k1(
         # Mass diagnostics — log_softmax over full vocab, freed immediately after gather.
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         student_log_probs_at_teacher = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+        student_log_probs_at_student = torch.gather(student_log_probs, dim=-1, index=student_topk_ids)
         del student_log_probs  # free (1, T, V)
         student_probs_at_teacher = student_log_probs_at_teacher.exp()
+        student_probs_at_student = student_log_probs_at_student.exp()
         teacher_probs_topk = teacher_topk_log_probs.exp()
 
         outputs: dict[str, torch.Tensor] = {}
@@ -179,9 +190,14 @@ def compute_student_topk_overlap_k1(
 
             # Symmetric top-j overlap via binary search — avoids the (1, T, j, j) bool.
             s_j = student_topk_ids[..., :j]
-            t_j_sorted, _ = teacher_topk_ids[..., :j].sort(dim=-1)
+            t_j_sorted, sort_idx = teacher_topk_ids[..., :j].sort(dim=-1)
+            teacher_lp_sorted_j = teacher_topk_log_probs[..., :j].gather(-1, sort_idx)
             pos = torch.searchsorted(t_j_sorted, s_j).clamp(max=j - 1)
             in_set = t_j_sorted.gather(-1, pos) == s_j
-            outputs[f"overlap_ratio_at_{j}"] = in_set.float().sum(dim=-1) / j
+            in_set_f = in_set.float()
+            outputs[f"overlap_ratio_at_{j}"] = in_set_f.sum(dim=-1) / j
+            outputs[f"overlap_student_mass_at_{j}"] = (student_probs_at_student[..., :j] * in_set_f).sum(dim=-1)
+            teacher_prob_at_s = teacher_lp_sorted_j.gather(-1, pos).exp()
+            outputs[f"overlap_teacher_mass_at_{j}"] = (teacher_prob_at_s * in_set_f).sum(dim=-1)
 
     return outputs
