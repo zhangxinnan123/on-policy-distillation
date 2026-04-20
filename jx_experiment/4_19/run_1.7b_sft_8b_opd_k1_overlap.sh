@@ -156,6 +156,7 @@ TRAINER=(
     trainer.save_freq=-1
     trainer.test_freq=40
     trainer.total_epochs=1
+    trainer.total_training_steps=200
     trainer.val_before_train=False
     trainer.use_legacy_worker_impl=disable
     trainer.resume_mode=disable
