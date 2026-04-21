@@ -125,6 +125,16 @@ class DistillationTeacherModelConfig(BaseConfig):
         Model path for the teacher model. Can be a local path or a Hugging Face model
     inference (RolloutConfig):
         Rollout configuration for the teacher model inference during distillation.
+    reapply_chat_template (bool):
+        If True, re-apply the teacher's chat template to the raw prompt before
+        concatenating the student's response ids. Useful when the teacher expects
+        a wrapped prompt format (e.g. Qwen3-Instruct) that the student did not use.
+        Requires the student and teacher to share a tokenizer so student response
+        ids can be reused verbatim.
+    enable_thinking (bool):
+        Passed to `tokenizer.apply_chat_template(enable_thinking=...)` when
+        `reapply_chat_template` is True. Only affects the prompt-side template;
+        the student's response is appended as-is.
     """
 
     _mutable_fields = BaseConfig._mutable_fields
@@ -134,6 +144,8 @@ class DistillationTeacherModelConfig(BaseConfig):
     nnodes: int = 0
     model_path: Optional[str] = None
     inference: RolloutConfig = field(default_factory=RolloutConfig)
+    reapply_chat_template: bool = False
+    enable_thinking: bool = False
 
 
 @dataclass

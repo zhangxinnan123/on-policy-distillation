@@ -14,7 +14,6 @@
 
 
 import torch
-import torch.nn.functional as F
 
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
@@ -62,9 +61,12 @@ def compute_forward_kl_topk(
         teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
     assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
 
-    # 2. compute token-wise KL divergence across sp groups
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+    # 2. compute token-wise KL divergence across sp groups.
+    # Avoid materializing the full (1, T, V) log_softmax — backward through
+    # `log_softmax` would retain it, adding ~V/topk memory for no benefit.
+    # log_softmax(x).gather(i) == x.gather(i) - logsumexp(x).
+    log_Z = student_logits.logsumexp(dim=-1, keepdim=True)  # (1, T, 1)
+    student_topk_log_probs = torch.gather(student_logits, dim=-1, index=teacher_topk_ids) - log_Z
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
     loss_config: DistillationLossConfig = config.distillation_loss
@@ -92,7 +94,9 @@ def compute_forward_kl_topk(
         student_probs_at_teacher = student_topk_log_probs.detach().exp()
         teacher_probs_topk = teacher_topk_log_probs.exp()
         # Student probs at student's own top-k ids, for mass-weighted overlap.
-        student_probs_at_student = torch.gather(student_log_probs, dim=-1, index=student_topk_ids).exp()
+        student_probs_at_student = (
+            torch.gather(student_logits, dim=-1, index=student_topk_ids) - log_Z
+        ).exp()
         for j in _overlap_thresholds(topk):
             outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
             outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
@@ -174,11 +178,13 @@ def compute_student_topk_overlap_k1(
                 parts.append(idx_i)
             student_topk_ids = torch.cat(parts, dim=1)
 
-        # Mass diagnostics — log_softmax over full vocab, freed immediately after gather.
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        student_log_probs_at_teacher = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
-        student_log_probs_at_student = torch.gather(student_log_probs, dim=-1, index=student_topk_ids)
-        del student_log_probs  # free (1, T, V)
+        # Mass diagnostics — avoid allocating the full (1, T, V) log_softmax.
+        # log_softmax(x).gather(i) == x.gather(i) - logsumexp(x), so we only ever
+        # hold (1, T, 1) logsumexp and the (1, T, topk) gathered slices.
+        log_Z = student_logits.logsumexp(dim=-1, keepdim=True)  # (1, T, 1)
+        student_log_probs_at_teacher = torch.gather(student_logits, dim=-1, index=teacher_topk_ids) - log_Z
+        student_log_probs_at_student = torch.gather(student_logits, dim=-1, index=student_topk_ids) - log_Z
+        del log_Z
         student_probs_at_teacher = student_log_probs_at_teacher.exp()
         student_probs_at_student = student_log_probs_at_student.exp()
         teacher_probs_topk = teacher_topk_log_probs.exp()
