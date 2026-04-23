@@ -52,10 +52,28 @@ distillation_loss:
   clip_ratio: 0.2
 
   # Lower bound for PPO clipping ratio.
-  clip_ratio_low: 0.2 
+  clip_ratio_low: 0.2
 
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
+
+  # --- Hybrid per-token partition (only used when loss_mode is a hybrid one, e.g. k1_pg_fkl_topk) ---
+  # distill_loss = pg_loss_coef * PG(pg_mask) + supervised_loss_coef * Supervised(sup_mask)
+  pg_loss_coef: 1.0
+  supervised_loss_coef: 1.0
+
+  # Which per-token mask strategy routes tokens between PG and supervised arms.
+  # Registered names live in verl/trainer/distillation/hybrid_masks.py:
+  #   "oot"           PG on tokens where sampled id is outside teacher top-k
+  #   "adv_threshold" PG where |k1_advantage| > threshold
+  #   "teacher_conf"  PG where teacher top-1 probability < threshold
+  #   "disagreement"  PG where sampled id != teacher top-1 id
+  #   "none"          all tokens → supervised (equivalent to forward_kl_topk)
+  #   "all"           all tokens → PG
+  hybrid_mask_strategy: "oot"
+
+  # Strategy-specific kwargs, e.g. {threshold: 0.5} for adv_threshold / teacher_conf.
+  hybrid_mask_kwargs: {}
 
 
 # teacher model config

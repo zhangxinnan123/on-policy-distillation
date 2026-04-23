@@ -74,6 +74,17 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # --- Hybrid (per-token partition of PG and supervised arms) ---
+    # Only used when the registered loss mode has use_hybrid=True, e.g. "k1_pg_fkl_topk".
+    # pg_loss_coef / supervised_loss_coef scale each arm in the final total:
+    #   distill_loss = pg_loss_coef * PG(pg_mask) + supervised_loss_coef * Supervised(sup_mask)
+    # hybrid_mask_strategy picks which per-token mask to use (registered in hybrid_masks.py).
+    # hybrid_mask_kwargs passes strategy-specific params (e.g. threshold for adv_threshold).
+    pg_loss_coef: float = 1.0
+    supervised_loss_coef: float = 1.0
+    hybrid_mask_strategy: str = "oot"
+    hybrid_mask_kwargs: dict = field(default_factory=dict)
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -109,6 +120,17 @@ class DistillationLossConfig(BaseConfig):
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
             )
+
+        # Validate hybrid mask strategy is registered. Hybrid modes route their own
+        # PG/supervised arms internally, so use_policy_gradient does not apply.
+        if self.loss_settings.use_hybrid:
+            from verl.trainer.distillation.hybrid_masks import MASK_REGISTRY
+
+            if self.hybrid_mask_strategy not in MASK_REGISTRY:
+                raise ValueError(
+                    f"Unknown hybrid_mask_strategy '{self.hybrid_mask_strategy}'. "
+                    f"Available: {sorted(MASK_REGISTRY.keys())}"
+                )
 
 
 @dataclass
