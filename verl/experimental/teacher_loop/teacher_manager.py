@@ -24,7 +24,7 @@ from torch.nn import functional as F
 from verl.experimental.agent_loop import AsyncLLMServerManager
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
 from verl.workers.config import DistillationConfig, DistillationLossConfig
 
 
@@ -106,13 +106,61 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(distillation_config)
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
         self.pad_token_id = pad_token_id
+        self.reapply_chat_template = self.distillation_config.teacher_model.reapply_chat_template
+        self.enable_thinking = self.distillation_config.teacher_model.enable_thinking
+        if self.reapply_chat_template:
+            teacher_model_path = self.distillation_config.teacher_model.model_path
+            if not teacher_model_path:
+                raise ValueError(
+                    "distillation.teacher_model.model_path is required when reapply_chat_template is True."
+                )
+            self.teacher_tokenizer = hf_tokenizer(teacher_model_path)
+        else:
+            self.teacher_tokenizer = None
+
+    def _build_teacher_sequence_ids(
+        self,
+        raw_prompt: Any,
+        student_response_ids: list[int],
+    ) -> tuple[list[int], int]:
+        """Apply teacher chat template to the prompt, then concat the student's response ids.
+
+        Response is appended verbatim (no assistant-turn wrapping) — relies on the student
+        and teacher sharing a tokenizer so the ids are valid in the teacher's frame.
+
+        Returns:
+            (teacher_sequence_ids, response_start) where response_start is the index in
+            teacher_sequence_ids at which the student's response begins.
+        """
+        messages = list(raw_prompt)
+        teacher_prompt_ids = self.teacher_tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        teacher_prompt_ids = normalize_token_ids(teacher_prompt_ids)
+        response_list = (
+            student_response_ids.tolist()
+            if hasattr(student_response_ids, "tolist")
+            else list(student_response_ids)
+        )
+        teacher_sequence_ids = list(teacher_prompt_ids) + response_list
+        return teacher_sequence_ids, len(teacher_prompt_ids)
 
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
+        response_slice: Optional[tuple[int, int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute teacher log probabilities for a single unpadded sequence."""
+        """Compute teacher log probabilities for a single unpadded sequence.
+
+        If `response_slice=(start, end)` is provided, the returned tensors are sliced
+        along the sequence dimension to cover only `[start, end)`. Used by the
+        `reapply_chat_template` path to return response-only tensors when the teacher
+        sequence has a different prompt tokenization than the student.
+        """
         multi_modal_data = multi_modal_data or {}
         teacher_output = await self.generate(
             request_id=uuid4().hex,
@@ -122,16 +170,29 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             video_data=multi_modal_data.get("videos"),
         )
         # Shapes: (S, K) where S is sequence length, K is 1 or topk
-        teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
+        # int64 required because downstream losses use teacher_ids as a gather index.
+        teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int64)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         # Shape: (S,) — teacher logprob for the actual next token at each position
         teacher_next_token_logprobs = torch.tensor(teacher_output.extra_fields["prompt_next_token_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == teacher_next_token_logprobs.shape[0] == len(sequence_ids)
+        # breakpoint()  # for debugging; remove later
+        if response_slice is not None:
+            start, end = response_slice
+            teacher_ids = teacher_ids[start:end]
+            teacher_logprobs = teacher_logprobs[start:end]
+            teacher_next_token_logprobs = teacher_next_token_logprobs[start:end]
         return teacher_ids, teacher_logprobs, teacher_next_token_logprobs
 
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
+        raw_prompt_batch = data.non_tensor_batch.get("raw_prompt") if self.reapply_chat_template else None
+        if self.reapply_chat_template and raw_prompt_batch is None:
+            raise ValueError(
+                "reapply_chat_template=True requires 'raw_prompt' in non_tensor_batch; "
+                "ensure the dataset attaches raw_prompt to each sample."
+            )
         tasks = []
         lengths = []
         prompt_width = data.batch["prompts"].shape[1]
@@ -142,15 +203,36 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             item = data[i : i + 1]
             sequence_ids, prompt_length, response_length = _unpad_teacher_inputs(item)
             multi_modal_data = None if multi_modal_data_batch is None else multi_modal_data_batch[i]
-            lengths.append((prompt_length, response_length))
-            tasks.append(
-                asyncio.create_task(
-                    self.compute_teacher_logprobs_single(
-                        sequence_ids=sequence_ids,
-                        multi_modal_data=multi_modal_data,
+
+            if self.reapply_chat_template:
+                student_response_ids = sequence_ids[prompt_length:]
+                teacher_sequence_ids, response_start = self._build_teacher_sequence_ids(
+                    raw_prompt=raw_prompt_batch[i],
+                    student_response_ids=student_response_ids,
+                )
+                # After slicing in compute_teacher_logprobs_single, returned tensors span
+                # only the response; _pad_teacher_outputs is called with prompt_length=0
+                # so the entire student prompt region is left-padded.
+                lengths.append((0, response_length))
+                tasks.append(
+                    asyncio.create_task(
+                        self.compute_teacher_logprobs_single(
+                            sequence_ids=teacher_sequence_ids,
+                            multi_modal_data=multi_modal_data,
+                            response_slice=(response_start, response_start + response_length),
+                        )
                     )
                 )
-            )
+            else:
+                lengths.append((prompt_length, response_length))
+                tasks.append(
+                    asyncio.create_task(
+                        self.compute_teacher_logprobs_single(
+                            sequence_ids=sequence_ids,
+                            multi_modal_data=multi_modal_data,
+                        )
+                    )
+                )
         outputs = await asyncio.gather(*tasks)
 
         # Pad the teacher logprobs, ids, and next-token logprobs

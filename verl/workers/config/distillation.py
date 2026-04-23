@@ -96,9 +96,9 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_mode in ("forward_kl_topk", "forward_kl_topk_approx"):
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."

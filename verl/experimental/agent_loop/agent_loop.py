@@ -256,6 +256,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    teacher_next_token_logprobs: Optional[torch.Tensor] = None
+    """Padded teacher log probabilities for the actual next token at each position."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -556,6 +558,9 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            # Support custom max_tokens for validation if specified
+            if hasattr(config.val_kwargs, 'max_tokens') and config.val_kwargs.max_tokens is not None:
+                sampling_params["max_tokens"] = config.val_kwargs.max_tokens
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -749,17 +754,19 @@ class AgentLoopWorker:
             response_ids=output.response_ids,
             validate=validate,
         )
-        teacher_ids, teacher_logprobs = (
+        teacher_ids, teacher_logprobs, teacher_next_token_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
+            output.extra_fields.pop("teacher_next_token_logprobs", None),
         )
         if teacher_ids is not None and teacher_logprobs is not None:
             # TODO(wuxibin): remove padding and use tensordict.
             from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
 
-            teacher_ids, teacher_logprobs = _pad_teacher_outputs(
+            teacher_ids, teacher_logprobs, teacher_next_token_logprobs = _pad_teacher_outputs(
                 teacher_ids,
                 teacher_logprobs,
+                teacher_next_token_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
                 prompt_length=len(output.prompt_ids),
@@ -780,6 +787,7 @@ class AgentLoopWorker:
             multi_modal_data=output.multi_modal_data,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            teacher_next_token_logprobs=teacher_next_token_logprobs,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -885,12 +893,13 @@ class AgentLoopWorker:
     async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate):
         """Compute teacher logprobs for single sample."""
         if self.stream_teacher_with_rollout and not validate:
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+            teacher_ids, teacher_logprobs, teacher_next_token_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            output.extra_fields["teacher_next_token_logprobs"] = teacher_next_token_logprobs
 
     def _postprocess(
         self,
@@ -914,6 +923,8 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+            if inputs[0].teacher_next_token_logprobs is not None:
+                optional_outputs["teacher_next_token_logprobs"] = torch.cat([input.teacher_next_token_logprobs for input in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

@@ -61,10 +61,11 @@ def default_compute_score(
     #     from . import math_dapo
 
     #     res = math_dapo.compute_score(solution_str, ground_truth)
-    elif data_source.startswith("math_dapo") or data_source.startswith("aime"):
-        from . import math_boxed
+    elif data_source.startswith("math_dapo") or data_source.startswith("aime") or data_source in ["amc23"]:
+        # from . import math_boxed
+        from . import math_verify
 
-        res = math_boxed.compute_score(solution_str, ground_truth)
+        res = math_verify.compute_score(solution_str, ground_truth)
         # from . import math_verify
 
         # res = math_dapo.compute_score(solution_str, ground_truth)

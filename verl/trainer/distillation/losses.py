@@ -142,11 +142,17 @@ def compute_topk_loss(
 
             if loss_mode == "k1_topk_overlap":
                 distillation_loss_fn = fsdp_losses.compute_student_topk_overlap_k1
+            elif loss_mode == "forward_kl_topk_approx":
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk_approx
             else:
                 distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if loss_mode == "forward_kl_topk_approx":
+                raise NotImplementedError(
+                    "forward_kl_topk_approx is only implemented for the fsdp backend."
+                )
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -430,7 +436,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "forward_kl_topk_approx"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
