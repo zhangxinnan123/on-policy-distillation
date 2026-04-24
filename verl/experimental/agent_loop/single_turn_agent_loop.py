@@ -68,12 +68,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
-        # Determine the truncation length based on whether this is validation
-        # If max_tokens is set in sampling_params (typically for validation), use it as the truncation length
-        # Otherwise, use the default response_length
-        truncation_length = sampling_params.get("max_tokens", self.response_length)
-        if truncation_length is None:
-            truncation_length = self.response_length
+        # TODO: support `sampling_params["max_tokens"] > self.response_length` (e.g. validation with
+        # longer generation budget). Using max_tokens directly breaks downstream assumptions in
+        # `_agent_loop_postprocess` (pad uses `max_length=rollout_config.response_length` and does
+        # not truncate, logprob `pad_size` goes negative, routed_experts/teacher pad widths drift,
+        # and batch collation in `async_generate_sequences` requires uniform length). To enable this
+        # path, thread the truncation length through postprocessing (and mirror in tool_agent_loop).
+        truncation_length = self.response_length
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
