@@ -37,6 +37,10 @@ class HybridMaskContext:
     teacher_topk_logprobs: torch.Tensor       # (B, T, K) float
     k1_per_token: torch.Tensor                # (B, T) float = student_lp - teacher_lp at sampled
     is_argmax: Optional[torch.Tensor] = None  # (B, T) bool, may be missing w/ fused kernels
+    # (B, T) precomputed student-mass coverage on teacher's top-p prefix,
+    # surfaced by the FSDP compute_forward_kl_topk logit processor. top_p is
+    # read from hybrid_mask_kwargs at compute time. None under megatron.
+    coverage_scores: Optional[torch.Tensor] = None
     mask_kwargs: dict = field(default_factory=dict)
 
 
@@ -134,83 +138,44 @@ def _mask_all(ctx: HybridMaskContext) -> torch.Tensor:
 
 @register_mask("coverage_threshold")
 def _mask_coverage_threshold(ctx: HybridMaskContext) -> torch.Tensor:
-    """PG where student's coverage of teacher's top-p region is below a threshold.
-    
-    Coverage is defined as the sum of student probabilities assigned to tokens 
-    in teacher's top-p region (cumulative probability >= top_p).
-    
+    """PG/sup routing by student probability mass on teacher's top-p region.
+
+    coverage = Σ_{i ∈ teacher_top_p} p_student(teacher_topk_ids[i])    ∈ [0, 1]
+
+    where teacher_top_p is the smallest prefix of teacher's (descending-sorted)
+    top-k whose cumulative probability ≥ top_p. top_p is applied inside the
+    FSDP logit processor (compute_forward_kl_topk); this mask just thresholds
+    the precomputed per-token scalar.
+
     Strategy kwargs:
-      top_p (float, default 0.9): Teacher's top-p threshold for defining high-confidence region.
-      coverage_threshold (float, default 0.5): Coverage threshold for routing decision.
-      inverse (bool, default True): Recommended routing logic.
-                                   - True: low coverage → supervised (force alignment)
-                                           high coverage → PG (preserve diversity)
-                                   - False: low coverage → PG (exploration) 
-                                            high coverage → supervised (refinement)
-    
-    Rationale: When student has low coverage of teacher's high-confidence region,
-    use supervised FKL to force alignment. When coverage is high (good alignment),
-    use PG to preserve diversity and avoid over-optimization.
+      coverage_threshold (float, default 0.5): score threshold for routing.
+      inverse (bool, default True):
+        - True : coverage ≥ threshold → PG (student already aligned)
+        - False: coverage <  threshold → PG (student misaligned, explore)
+      top_p is read by the logit processor, not here.
+
+    Requires coverage_scores in HybridMaskContext (FSDP backend only).
     """
-    top_p = float(ctx.mask_kwargs.get("top_p", 0.9))
+    if ctx.coverage_scores is None:
+        raise NotImplementedError(
+            "coverage_threshold requires coverage_scores in HybridMaskContext. "
+            "Currently surfaced only by the FSDP compute_forward_kl_topk logit "
+            "processor; megatron's fused KL kernel does not expose it."
+        )
+
     coverage_threshold = float(ctx.mask_kwargs.get("coverage_threshold", 0.5))
     inverse = bool(ctx.mask_kwargs.get("inverse", True))
-    
-    # Get teacher top-k probabilities and sort by probability (descending)
-    teacher_probs = ctx.teacher_topk_logprobs.exp()  # (B, T, K)
-    teacher_ids = ctx.teacher_topk_ids  # (B, T, K)
-    
-    batch_size, seq_len, top_k = teacher_probs.shape
-    device = teacher_probs.device
-    
-    # Vectorized approach for efficiency
-    # Sort teacher probabilities along top-k dimension
-    sorted_probs, sorted_indices = torch.sort(teacher_probs, dim=-1, descending=True)  # (B, T, K)
-    sorted_ids = torch.gather(teacher_ids, dim=-1, index=sorted_indices)  # (B, T, K)
-    
-    # Calculate cumulative probabilities
-    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)  # (B, T, K)
-    
-    # Find top-p boundary: first position where cumsum >= top_p
-    # Create mask for tokens in top-p
-    in_top_p = cumsum_probs <= top_p  # (B, T, K)
-    # Include at least the first token
-    in_top_p[..., 0] = True
-    # Also include the first token that pushes us over top_p
-    shifted_cumsum = torch.cat([torch.zeros_like(cumsum_probs[..., :1]), cumsum_probs[..., :-1]], dim=-1)
-    boundary = (shifted_cumsum < top_p) & (cumsum_probs >= top_p)
-    in_top_p = in_top_p | boundary
-    
-    # Check if student's sampled token is in teacher's top-p
-    student_sampled_expanded = ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, 1)
-    matches = (sorted_ids == student_sampled_expanded) & in_top_p  # (B, T, K)
-    any_match = matches.any(dim=-1)  # (B, T)
-    
-    # Get the probability for matched tokens
-    # Where there's a match, extract the teacher's probability
-    coverage_scores = torch.zeros(batch_size, seq_len, device=device)
-    match_indices = matches.float().argmax(dim=-1)  # Get index of match (or 0 if no match)
-    matched_probs = torch.gather(sorted_probs, dim=-1, index=match_indices.unsqueeze(-1)).squeeze(-1)
-    coverage_scores = torch.where(any_match, matched_probs, torch.zeros_like(matched_probs))
-    
-    # Apply response mask
-    coverage_scores = coverage_scores * ctx.response_mask.float()
-    
-    # Apply threshold to determine mask
+
+    coverage = ctx.coverage_scores  # (B, T), in [0, 1]
     if inverse:
-        # Use PG when coverage is HIGH (for aggressive alignment)
-        pg_mask = coverage_scores >= coverage_threshold
+        pg_mask = coverage >= coverage_threshold
     else:
-        # Use PG when coverage is LOW (for exploration)
-        pg_mask = coverage_scores < coverage_threshold
-    
-    # Store coverage scores for metrics logging (will be passed to model_output)
-    # Use a special key that won't conflict with user-provided kwargs
-    if not hasattr(ctx, '_debug_outputs'):
+        pg_mask = coverage < coverage_threshold
+
+    if not hasattr(ctx, "_debug_outputs"):
         ctx._debug_outputs = {}
-    ctx._debug_outputs['coverage_scores'] = coverage_scores
-    # Don't store scalars, they can't be processed in model_output
-    
+    ctx._debug_outputs["coverage_scores"] = coverage
+
     return pg_mask
 
 

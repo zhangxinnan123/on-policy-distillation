@@ -68,13 +68,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
+        # Determine the truncation length based on whether this is validation
+        # If max_tokens is set in sampling_params (typically for validation), use it as the truncation length
+        # Otherwise, use the default response_length
+        truncation_length = sampling_params.get("max_tokens", self.response_length)
+        if truncation_length is None:
+            truncation_length = self.response_length
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
+            response_ids=output.token_ids[: truncation_length],
+            response_mask=response_mask[: truncation_length],
+            response_logprobs=output.log_probs[: truncation_length] if output.log_probs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
+                output.routed_experts[: len(prompt_ids) + truncation_length]
                 if output.routed_experts is not None
                 else None
             ),

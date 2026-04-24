@@ -691,6 +691,9 @@ def compute_k1_pg_fkl_topk(
     is_argmax_padded = None
     if "is_argmax" in model_output:
         is_argmax_padded = no_padding_2_padding(model_output["is_argmax"], data).bool()
+    coverage_scores = None
+    if "coverage_scores" in model_output:
+        coverage_scores = no_padding_2_padding(model_output["coverage_scores"], data)
     ctx = HybridMaskContext(
         response_mask=response_mask_bool,
         student_sampled_ids=responses,
@@ -700,6 +703,7 @@ def compute_k1_pg_fkl_topk(
         teacher_topk_logprobs=teacher_topk_logprobs,
         k1_per_token=k1_per_token,
         is_argmax=is_argmax_padded,
+        coverage_scores=coverage_scores,
         mask_kwargs=dict(loss_config.hybrid_mask_kwargs) if loss_config.hybrid_mask_kwargs else {},
     )
     mask_fn = get_mask_fn(loss_config.hybrid_mask_strategy)

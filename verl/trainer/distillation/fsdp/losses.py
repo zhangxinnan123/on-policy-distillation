@@ -67,15 +67,32 @@ def compute_forward_kl_topk(
     # log_softmax(x).gather(i) == x.gather(i) - logsumexp(x).
     log_Z = student_logits.logsumexp(dim=-1, keepdim=True)  # (1, T, 1)
     student_topk_log_probs = torch.gather(student_logits, dim=-1, index=teacher_topk_ids) - log_Z
+    teacher_probs_topk = teacher_topk_log_probs.exp()
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
-    teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+    teacher_mass = teacher_probs_topk.sum(dim=-1)
     loss_config: DistillationLossConfig = config.distillation_loss
-    if loss_config.log_prob_min_clamp is not None:
-        student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-        teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+    # if loss_config.log_prob_min_clamp is not None:
+    #     student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+    #     teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
 
-    outputs = {"distillation_losses": distillation_losses, "student_mass": student_mass, "teacher_mass": teacher_mass}
+    # Per-token coverage = Σ p_student(t) for t ∈ teacher's top-p prefix.
+    # Precomputed here so the logit-processor output contract stays (1, T) —
+    # the engine wraps these as per-token jagged nested tensors downstream.
+    # Consumed by the coverage_threshold hybrid mask strategy.
+    hybrid_kwargs = loss_config.hybrid_mask_kwargs or {}
+    top_p = float(hybrid_kwargs.get("top_p", 0.9))
+    cumsum = teacher_probs_topk.cumsum(dim=-1)
+    shifted = torch.cat([torch.zeros_like(cumsum[..., :1]), cumsum[..., :-1]], dim=-1)
+    in_top_p = shifted < top_p
+    coverage_scores = (student_topk_log_probs.detach().exp() * in_top_p.float()).sum(dim=-1)
+
+    outputs = {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "coverage_scores": coverage_scores,
+    }
 
     # 3. per-j overlap diagnostics (no_grad — diagnostic only, no activations retained)
     with torch.no_grad():

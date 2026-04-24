@@ -469,8 +469,6 @@ class RayPPOTrainer:
         if generations_to_log == 0:
             return
 
-        import numpy as np
-
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
@@ -532,6 +530,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         sample_complete = []  # 1.0 if generation ended with EOS, else 0.0
+        sample_lengths = []  # Response lengths for each sample
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -594,6 +593,7 @@ class RayPPOTrainer:
             last_tokens = output_ids[torch.arange(output_ids.size(0), device=output_ids.device), last_idx]
             is_complete = (last_tokens == self.tokenizer.eos_token_id) & (resp_lengths > 0)
             sample_complete.extend(is_complete.float().cpu().tolist())
+            sample_lengths.extend(resp_lengths.cpu().tolist())
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -655,6 +655,12 @@ class RayPPOTrainer:
         val_metrics = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
         if sample_complete:
             val_metrics["val/response/complete_ratio"] = sum(sample_complete) / len(sample_complete)
+        if sample_lengths:
+            sample_lengths_array = np.array(sample_lengths)
+            val_metrics["val/response_length/mean"] = float(sample_lengths_array.mean())
+            val_metrics["val/response_length/std"] = float(sample_lengths_array.std())
+            val_metrics["val/response_length/min"] = float(sample_lengths_array.min())
+            val_metrics["val/response_length/max"] = float(sample_lengths_array.max())
         return val_metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
