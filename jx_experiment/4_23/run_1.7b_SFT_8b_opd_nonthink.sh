@@ -14,7 +14,7 @@ TEACHER_MODEL=Qwen/Qwen3-8B
 # Hybrid per-token partition of k1 PG and supervised forward_kl_topk.
 # The outer use_policy_gradient switch is ignored for hybrid modes — the registered
 # loss routes tokens between the two arms internally via hybrid_mask_strategy.
-USE_POLICY_GRADIENT=False
+USE_POLICY_GRADIENT=True
 DISTILLATION_LOSS_MODE="k1"
 USE_FUSED_KERNELS=False
 
