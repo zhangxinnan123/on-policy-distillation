@@ -8,7 +8,7 @@ source "$(dirname "$0")/../config.sh"
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=lllyx/Qwen3-1.7B-SFT
+STUDENT_MODEL=Qwen/Qwen3-1.7B-Base
 TEACHER_MODEL=Qwen/Qwen3-8B
 
 # Hybrid per-token partition of k1 PG and supervised forward_kl_topk.
