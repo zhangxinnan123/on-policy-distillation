@@ -829,6 +829,26 @@ def compute_k1_topk_overlap(
             break
         j = min(j * 2, topk)
 
+    # Diagnostic-only top-p coverage scalars (no mask routing in this loss). Mirrors the
+    # set emitted by compute_k1_pg_fkl_topk so dashboards can compare across modes.
+    if "coverage_scores" in model_output:
+        loss_config = distillation_config.distillation_loss
+        coverage_scores = no_padding_2_padding(model_output["coverage_scores"], data)
+        valid_coverage = coverage_scores[response_mask_bool]
+        metrics["distillation/top_p_coverage_mean"] = Metric(AggregationType.MEAN, valid_coverage.mean())
+        metrics["distillation/top_p_coverage_std"] = Metric(AggregationType.MEAN, valid_coverage.std())
+        coverage_threshold = float(
+            (loss_config.hybrid_mask_kwargs or {}).get("coverage_threshold", 0.5)
+        )
+        metrics["distillation/top_p_high_coverage_ratio"] = Metric(
+            AggregationType.MEAN, (valid_coverage >= coverage_threshold).float().mean()
+        )
+        metrics["distillation/top_p_zero_coverage_ratio"] = Metric(
+            AggregationType.MEAN, (valid_coverage == 0).float().mean()
+        )
+        metrics["distillation/top_p_coverage_min"] = Metric(AggregationType.MIN, valid_coverage.min())
+        metrics["distillation/top_p_coverage_max"] = Metric(AggregationType.MAX, valid_coverage.max())
+
     return distillation_losses, metrics
 
 

@@ -322,7 +322,7 @@ def compute_student_topk_overlap_k1(
       - Overlap uses `searchsorted` (O(T·j) memory) rather than the full pairwise
         bool (O(T·j²)).
     """
-    del config, data_format  # unused; signature kept for backend-parity
+    del data_format  # unused; signature kept for backend-parity
     assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
 
     # All overlap/mass diagnostics are gradient-free — no activations need to be retained.
@@ -360,6 +360,16 @@ def compute_student_topk_overlap_k1(
         teacher_probs_topk = teacher_topk_log_probs.exp()
 
         outputs: dict[str, torch.Tensor] = {}
+
+        # Diagnostic-only coverage = Σ p_student(t) for t ∈ teacher's top-p prefix.
+        # Mirrors compute_forward_kl_topk so the registered loss can emit
+        # top_p_coverage_* metrics for cross-mode comparison. No mask routing here.
+        hybrid_kwargs = config.distillation_loss.hybrid_mask_kwargs or {}
+        top_p = float(hybrid_kwargs.get("top_p", 0.9))
+        cumsum = teacher_probs_topk.cumsum(dim=-1)
+        shifted = torch.cat([torch.zeros_like(cumsum[..., :1]), cumsum[..., :-1]], dim=-1)
+        in_top_p = shifted < top_p
+        outputs["coverage_scores"] = (student_probs_at_teacher * in_top_p.float()).sum(dim=-1)
         for j in _overlap_thresholds(topk):
             outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
             outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
