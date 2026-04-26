@@ -22,7 +22,7 @@ USE_FUSED_KERNELS=False
 # Using the new coverage_threshold strategy with top-p based coverage
 HYBRID_MASK_STRATEGY="coverage_threshold"
 HYBRID_MASK_TOP_P=0.9           # Teacher's top-p threshold for defining high-confidence region
-HYBRID_MASK_COVERAGE_THRESHOLD=0.3  # Coverage threshold for PG vs supervised routing  
+HYBRID_MASK_COVERAGE_THRESHOLD=0.5  # Coverage threshold for PG vs supervised routing  
 HYBRID_MASK_INVERSE=true        # Use supervised when coverage < threshold (force alignment mode)
 
 PG_LOSS_COEF=1.0
