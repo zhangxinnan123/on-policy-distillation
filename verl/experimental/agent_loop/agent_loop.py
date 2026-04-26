@@ -562,6 +562,11 @@ class AgentLoopWorker:
             if hasattr(config.val_kwargs, 'max_tokens') and config.val_kwargs.max_tokens is not None:
                 sampling_params["max_tokens"] = config.val_kwargs.max_tokens
 
+        # All samples in this call must share a response width so that per-sample tensors
+        # concat in `_postprocess`. When validation overrides max_tokens above the trained
+        # response_length, widen the budget for this call only.
+        effective_response_length = max(config.response_length, sampling_params.get("max_tokens", 0) or 0)
+
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
@@ -598,7 +603,13 @@ class AgentLoopWorker:
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop(
+                        sampling_params,
+                        trajectory_info[i],
+                        trace=trace_this_sample,
+                        effective_response_length=effective_response_length,
+                        **kwargs,
+                    )
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -615,6 +626,7 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         trace: bool = True,
+        effective_response_length: int | None = None,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -639,12 +651,23 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
+            if effective_response_length is None:
+                effective_response_length = self.rollout_config.response_length
+            # Per-call instance — safe to override so generation truncation and
+            # multi-turn termination use the validation budget when widened.
+            agent_loop.response_length = effective_response_length
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await self._agent_loop_postprocess(
+                output, trajectory["validate"], effective_response_length, **kwargs
+            )
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(
+        self, output, validate, effective_response_length: int | None = None, **kwargs
+    ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if effective_response_length is None:
+            effective_response_length = self.rollout_config.response_length
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -683,7 +706,7 @@ class AgentLoopWorker:
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=effective_response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -694,7 +717,7 @@ class AgentLoopWorker:
         response_mask_output = self.tokenizer.pad(
             {"input_ids": output.response_mask},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=effective_response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -703,7 +726,7 @@ class AgentLoopWorker:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            pad_size = effective_response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
