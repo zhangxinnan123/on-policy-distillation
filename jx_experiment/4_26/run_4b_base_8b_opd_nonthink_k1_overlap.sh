@@ -39,7 +39,7 @@ MAX_NUM_TOKENS=$(( MAX_PROMPT + VAL_MAX_RESPONSE_LENGTH + 1 ))
 # so keep batch + topk conservative.
 MAX_NUM_SEQS=128
 TRAIN_PROMPT_BSZ=128
-
+MINI_BATCH_SIZE=32
 
 STUDENT_MICRO_BATCH_SIZE_PER_GPU=1
 STUDENT_MAX_TOKEN_LEN_PER_GPU=$(( STUDENT_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT + MAX_RESPONSE_LENGTH) ))
@@ -128,7 +128,7 @@ DISTILLATION=(
 
 STUDENT=(
     actor_rollout_ref.actor.optim.lr=$LR
-    actor_rollout_ref.actor.ppo_mini_batch_size=$TRAIN_PROMPT_BSZ
+    actor_rollout_ref.actor.ppo_mini_batch_size=$MINI_BATCH_SIZE
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$STUDENT_MICRO_BATCH_SIZE_PER_GPU
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$STUDENT_MAX_TOKEN_LEN_PER_GPU
     actor_rollout_ref.actor.use_dynamic_bsz=$USE_DYNAMIC_BSZ
