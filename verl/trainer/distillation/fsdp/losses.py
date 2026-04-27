@@ -76,6 +76,13 @@ def compute_forward_kl_topk(
     #     teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
 
+    # Student probs at teacher top-k positions — detached, used by opd_theory_guided mask.
+    student_topk_probs = student_topk_log_probs.detach().exp()  # (1, T, K)
+
+    # S2 = Σ_b pi_S(b)² via logsumexp identity: exp(logsumexp(2·x) − 2·log_Z).
+    # Avoids materializing the full (1, T, V) softmax. Detached — routing signal only.
+    student_s2 = (student_logits.detach().mul(2).logsumexp(dim=-1) - 2 * log_Z.detach().squeeze(-1)).exp()  # (1, T)
+
     # Per-token coverage = Σ p_student(t) for t ∈ teacher's top-p prefix.
     # Precomputed here so the logit-processor output contract stays (1, T) —
     # the engine wraps these as per-token jagged nested tensors downstream.
@@ -85,13 +92,15 @@ def compute_forward_kl_topk(
     cumsum = teacher_probs_topk.cumsum(dim=-1)
     shifted = torch.cat([torch.zeros_like(cumsum[..., :1]), cumsum[..., :-1]], dim=-1)
     in_top_p = shifted < top_p
-    coverage_scores = (student_topk_log_probs.detach().exp() * in_top_p.float()).sum(dim=-1)
+    coverage_scores = (student_topk_probs * in_top_p.float()).sum(dim=-1)
 
     outputs = {
         "distillation_losses": distillation_losses,
         "student_mass": student_mass,
         "teacher_mass": teacher_mass,
         "coverage_scores": coverage_scores,
+        "student_topk_probs": student_topk_probs,
+        "student_s2": student_s2,
     }
 
     # 3. per-j overlap diagnostics (no_grad — diagnostic only, no activations retained)

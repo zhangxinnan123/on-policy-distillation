@@ -181,7 +181,7 @@ def compute_topk_loss(
 
     expected_shape = student_logits.shape[:2]
     for k, v in outputs.items():
-        assert v.shape == expected_shape, f"Expected shape {expected_shape}, but got {v.shape} for {k=}."
+        assert v.shape[:2] == expected_shape, f"Expected leading shape {expected_shape}, but got {v.shape} for {k=}."
 
     return outputs
 
@@ -292,49 +292,85 @@ def distillation_loss(
     loss_config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
     if loss_config.loss_settings.use_hybrid:
-        # Hybrid: partition response tokens into PG (from k1 advantage) and supervised
-        # (from forward_kl_topk) via a per-token mask strategy. The registered fn has
-        # stashed k1_per_token + disjoint sub-masks on model_output.
+        # Hybrid: partition response tokens via a per-token mask strategy. The registered
+        # fn stashes k1_per_token + disjoint sub-masks on model_output, plus a combine_mode
+        # key that selects how the two arms are combined.
         pg_mask = model_output["_hybrid_pg_mask"]
         sup_mask = model_output["_hybrid_sup_mask"]
         k1_per_token = model_output["_hybrid_k1_per_token"]
+        combine_mode = model_output.get("_hybrid_combine_mode", "k1_pg_fkl_topk")
 
-        # Supervised arm: aggregate FKL per-token losses over sup_mask only. Using the
-        # global response-token denominator (batch_num_tokens) so each arm's scalar
-        # contribution scales naturally with its mask share.
-        sup_loss = agg_loss(
-            loss_mat=distillation_losses,
-            loss_mask=sup_mask,
-            loss_agg_mode=loss_agg_mode,
-            **loss_config.global_batch_info,
-        )
+        if combine_mode == "rkl_all_fkl_masked":
+            # RKL arm: PG update using k1 as per-token advantage, over ALL response tokens.
+            # Mirrors the pure use_policy_gradient path but without restricting to a sub-mask.
+            rkl_advantages = -k1_per_token.detach()
+            rkl_loss, rkl_pg_metrics, rkl_extra_metrics = _compute_pg_distillation_loss(
+                config=config,
+                loss_config=loss_config,
+                loss_agg_mode=loss_agg_mode,
+                model_output=model_output,
+                data=data,
+                dp_group=dp_group,
+                response_mask=response_mask,
+                pg_start_mask=response_mask,
+                distill_advantages=rkl_advantages,
+            )
+            distillation_metrics.update(rkl_pg_metrics)
+            distillation_metrics.update(rkl_extra_metrics)
+            # FKL arm: forward KL topk supervised loss restricted to sup_mask tokens.
+            fkl_loss = agg_loss(
+                loss_mat=distillation_losses,
+                loss_mask=sup_mask,
+                loss_agg_mode=loss_agg_mode,
+                **loss_config.global_batch_info,
+            )
+            distillation_loss = (
+                loss_config.pg_loss_coef * rkl_loss + loss_config.supervised_loss_coef * fkl_loss
+            )
+            distillation_metrics["distillation/rkl_all_loss"] = Metric(
+                value=rkl_loss.detach(), aggregation=AggregationType.MEAN
+            )
+            distillation_metrics["distillation/fkl_masked_loss"] = Metric(
+                value=fkl_loss.detach(), aggregation=AggregationType.MEAN
+            )
+        else:
+            # k1_pg_fkl_topk: PG arm on pg_mask, FKL supervised arm on sup_mask.
+            # Supervised arm: aggregate FKL per-token losses over sup_mask only. Using the
+            # global response-token denominator (batch_num_tokens) so each arm's scalar
+            # contribution scales naturally with its mask share.
+            sup_loss = agg_loss(
+                loss_mat=distillation_losses,
+                loss_mask=sup_mask,
+                loss_agg_mode=loss_agg_mode,
+                **loss_config.global_batch_info,
+            )
 
-        # PG arm: use -k1_per_token as advantage. Share the same advantage-gating logic
-        # as the pure use_policy_gradient path. advantage_mask_* further prunes pg_mask.
-        pg_advantages = -k1_per_token.detach()
-        pg_loss, pg_metrics, pg_extra_metrics = _compute_pg_distillation_loss(
-            config=config,
-            loss_config=loss_config,
-            loss_agg_mode=loss_agg_mode,
-            model_output=model_output,
-            data=data,
-            dp_group=dp_group,
-            response_mask=response_mask,
-            pg_start_mask=pg_mask,
-            distill_advantages=pg_advantages,
-        )
-        distillation_metrics.update(pg_metrics)
-        distillation_metrics.update(pg_extra_metrics)
+            # PG arm: use -k1_per_token as advantage. Share the same advantage-gating logic
+            # as the pure use_policy_gradient path. advantage_mask_* further prunes pg_mask.
+            pg_advantages = -k1_per_token.detach()
+            pg_loss, pg_metrics, pg_extra_metrics = _compute_pg_distillation_loss(
+                config=config,
+                loss_config=loss_config,
+                loss_agg_mode=loss_agg_mode,
+                model_output=model_output,
+                data=data,
+                dp_group=dp_group,
+                response_mask=response_mask,
+                pg_start_mask=pg_mask,
+                distill_advantages=pg_advantages,
+            )
+            distillation_metrics.update(pg_metrics)
+            distillation_metrics.update(pg_extra_metrics)
 
-        distillation_loss = (
-            loss_config.pg_loss_coef * pg_loss + loss_config.supervised_loss_coef * sup_loss
-        )
-        distillation_metrics["distillation/pg_loss"] = Metric(
-            value=pg_loss.detach(), aggregation=AggregationType.MEAN
-        )
-        distillation_metrics["distillation/supervised_loss"] = Metric(
-            value=sup_loss.detach(), aggregation=AggregationType.MEAN
-        )
+            distillation_loss = (
+                loss_config.pg_loss_coef * pg_loss + loss_config.supervised_loss_coef * sup_loss
+            )
+            distillation_metrics["distillation/pg_loss"] = Metric(
+                value=pg_loss.detach(), aggregation=AggregationType.MEAN
+            )
+            distillation_metrics["distillation/supervised_loss"] = Metric(
+                value=sup_loss.detach(), aggregation=AggregationType.MEAN
+            )
     elif loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
         distill_advantages = -distillation_losses.detach()
@@ -694,6 +730,12 @@ def compute_k1_pg_fkl_topk(
     coverage_scores = None
     if "coverage_scores" in model_output:
         coverage_scores = no_padding_2_padding(model_output["coverage_scores"], data)
+    student_topk_probs = None
+    if "student_topk_probs" in model_output:
+        student_topk_probs = no_padding_2_padding(model_output["student_topk_probs"], data)
+    student_s2 = None
+    if "student_s2" in model_output:
+        student_s2 = no_padding_2_padding(model_output["student_s2"], data)
     ctx = HybridMaskContext(
         response_mask=response_mask_bool,
         student_sampled_ids=responses,
@@ -704,6 +746,8 @@ def compute_k1_pg_fkl_topk(
         k1_per_token=k1_per_token,
         is_argmax=is_argmax_padded,
         coverage_scores=coverage_scores,
+        student_topk_probs=student_topk_probs,
+        student_s2=student_s2,
         mask_kwargs=dict(loss_config.hybrid_mask_kwargs) if loss_config.hybrid_mask_kwargs else {},
     )
     mask_fn = get_mask_fn(loss_config.hybrid_mask_strategy)
@@ -714,11 +758,12 @@ def compute_k1_pg_fkl_topk(
     pg_mask = pg_mask_raw.bool() & response_mask_bool
     sup_mask = response_mask_bool & ~pg_mask
 
-    # Stash PG-side tensors for the outer combine path. Using "_hybrid_*" keys to signal
+    # Stash tensors for the outer combine path. Using "_hybrid_*" keys to signal
     # intra-module coupling (see distillation_loss() for the reader side).
     model_output["_hybrid_k1_per_token"] = k1_per_token
     model_output["_hybrid_pg_mask"] = pg_mask
     model_output["_hybrid_sup_mask"] = sup_mask
+    model_output["_hybrid_combine_mode"] = "k1_pg_fkl_topk"
     
     # Store coverage scores if available (from coverage-based mask strategies)
     if hasattr(ctx, '_debug_outputs') and 'coverage_scores' in ctx._debug_outputs:
@@ -779,6 +824,29 @@ def compute_k1_pg_fkl_topk(
             )
 
     return sup_losses, distillation_metrics
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["rkl_all_fkl_masked"], use_topk=True, use_hybrid=True)
+)  # type: ignore[arg-type]
+def compute_rkl_all_fkl_masked(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Hybrid: reverse KL (k1) on all response tokens + forward KL topk on masked subset.
+
+    Uses the same mask strategy as k1_pg_fkl_topk to split response tokens into two groups,
+    but instead of a PG arm on pg_mask, applies reverse KL (k1 estimator) to every token.
+    The forward KL topk supervised loss is restricted to the sup_mask (FKL-routed) tokens.
+
+    Combine path (in distillation_loss):
+        total = pg_loss_coef * RKL(all) + supervised_loss_coef * FKL(sup_mask)
+    """
+    sup_losses, metrics = compute_k1_pg_fkl_topk(config, distillation_config, model_output, data)
+    model_output["_hybrid_combine_mode"] = "rkl_all_fkl_masked"
+    return sup_losses, metrics
 
 
 @register_distillation_loss(DistillationLossSettings(names=["k1_topk_overlap"], use_topk=True))  # type: ignore[arg-type]

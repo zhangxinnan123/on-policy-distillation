@@ -1065,7 +1065,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
-                        assert v.shape == log_probs.shape, f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                        assert v.shape[0] == log_probs.shape[0], f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                         if self.use_ulysses_sp:
                             pad_size = output_args["pad_size"]
                             v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)

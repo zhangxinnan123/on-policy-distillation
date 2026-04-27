@@ -8,4 +8,4 @@ PROJECT_NAME="verl_opd_dapo"
 
 # Activate conda environment
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opd
+# conda activate opd

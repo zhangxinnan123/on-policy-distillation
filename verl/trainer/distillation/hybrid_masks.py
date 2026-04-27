@@ -41,6 +41,12 @@ class HybridMaskContext:
     # surfaced by the FSDP compute_forward_kl_topk logit processor. top_p is
     # read from hybrid_mask_kwargs at compute time. None under megatron.
     coverage_scores: Optional[torch.Tensor] = None
+    # (B, T, K) student probs at teacher top-k positions — required by opd_theory_guided.
+    # Computed in fsdp/losses.py as student_topk_log_probs.exp(); no full-vocab materialization.
+    student_topk_probs: Optional[torch.Tensor] = None
+    # (B, T) Σ_b pi_S(b)² — required by opd_theory_guided.
+    # Computed in fsdp/losses.py via the logsumexp identity exp(logsumexp(2x) − 2·log_Z).
+    student_s2: Optional[torch.Tensor] = None
     mask_kwargs: dict = field(default_factory=dict)
 
 
@@ -179,55 +185,105 @@ def _mask_coverage_threshold(ctx: HybridMaskContext) -> torch.Tensor:
     return pg_mask
 
 
-@register_mask("coverage_adaptive")
-def _mask_coverage_adaptive(ctx: HybridMaskContext) -> torch.Tensor:
-    """Adaptive coverage-based masking with position and confidence weighting.
-    
+@register_mask("opd_theory_guided")
+def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
+    """Theory-guided OPD routing based on the sign of the per-token k1 advantage.
+
+    Uses k1 = log pi_T(a) - log pi_S(a) as the advantage signal (positive means
+    teacher favors a more than student), ctx.student_topk_probs for pi_c, and
+    ctx.student_s2 for the collision probability.
+
+    Returns pg_mask (B, T): True → PG/RL arm, False → FKL / teacher top-p arm.
+
+    Routing logic (a = sampled token, c = teacher top-p candidate, S2 = Σ_b pi_S(b)²):
+
+      Rule 1 (low-coverage):  pi_c < student_low_threshold  → FKL
+      Rule 2 (negative k1):   k1(a) < 0 and pi_a + pi_c ≤ S2  → FKL
+                               (student overrates a; RL cannot reliably raise pi_c)
+      Rule 3 (positive k1):   k1(a) > 0, a ∉ teacher top-p, pi_a + pi_c ≥ S2  → FKL
+                               (optimizing non-teacher token a would squeeze out c)
+
+    If any teacher-candidate c at a position triggers a FKL rule, the whole
+    position routes to FKL.
+
     Strategy kwargs:
-      top_p (float, default 0.9): Teacher's top-p threshold.
-      base_threshold (float, default 0.5): Base coverage threshold.
-      position_decay (float, default 0.1): Reduce threshold for later positions.
-      confidence_weight (float, default 0.2): Weight teacher confidence in threshold.
-      min_threshold (float, default 0.1): Minimum threshold value.
-      max_threshold (float, default 0.8): Maximum threshold value.
-    
-    Rationale: Early tokens need more context preservation (lower threshold),
-    later tokens can be more aggressively masked. Teacher confidence also
-    affects the threshold - when teacher is confident, require higher coverage.
+      student_low_threshold (float, default 1e-3)
+      teacher_top_p (float, default 0.9): nucleus probability mass for teacher candidates
+      adv_eps (float, default 0.0): dead-zone around zero for k1 sign
+      use_low_coverage_rule (bool, default True)
+      use_negative_rule (bool, default True)
+      use_positive_rule (bool, default True)
+
+    Requires ctx.student_topk_probs (B, T, K) and ctx.student_s2 (B, T) to be populated.
+    Both are computed by compute_forward_kl_topk in fsdp/losses.py (FSDP backend only).
     """
-    top_p = float(ctx.mask_kwargs.get("top_p", 0.9))
-    base_threshold = float(ctx.mask_kwargs.get("base_threshold", 0.5))
-    position_decay = float(ctx.mask_kwargs.get("position_decay", 0.1))
-    confidence_weight = float(ctx.mask_kwargs.get("confidence_weight", 0.2))
-    min_threshold = float(ctx.mask_kwargs.get("min_threshold", 0.1))
-    max_threshold = float(ctx.mask_kwargs.get("max_threshold", 0.8))
-    
-    batch_size, seq_len = ctx.response_mask.shape
-    device = ctx.response_mask.device
-    
-    # Calculate position-dependent threshold
-    positions = torch.arange(seq_len, device=device).float()
-    position_factor = torch.exp(-position_decay * positions / seq_len)
-    
-    # Calculate teacher confidence (top-1 probability)
-    teacher_confidence = ctx.teacher_topk_logprobs[..., 0].exp()  # (B, T)
-    
-    # Adaptive threshold per position
-    adaptive_threshold = base_threshold * position_factor.unsqueeze(0)  # (1, T)
-    adaptive_threshold = adaptive_threshold + confidence_weight * teacher_confidence
-    adaptive_threshold = torch.clamp(adaptive_threshold, min_threshold, max_threshold)
-    
-    # Calculate coverage (simplified version using teacher prob at sampled token)
-    teacher_prob_at_sampled = ctx.teacher_log_prob_at_sampled.exp()  # (B, T)
-    
-    # Check if sampled token is in teacher's top-k (proxy for top-p)
+    if ctx.student_topk_probs is None or ctx.student_s2 is None:
+        raise ValueError(
+            "opd_theory_guided requires student_topk_probs and student_s2 in "
+            "HybridMaskContext. These are populated by compute_forward_kl_topk "
+            "in fsdp/losses.py (FSDP backend only)."
+        )
+
+    student_low_threshold = float(ctx.mask_kwargs.get("student_low_threshold", 1e-3))
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
+    adv_eps = float(ctx.mask_kwargs.get("adv_eps", 0.0))
+    use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+    use_negative_rule = bool(ctx.mask_kwargs.get("use_negative_rule", True))
+    use_positive_rule = bool(ctx.mask_kwargs.get("use_positive_rule", True))
+
+    s2 = ctx.student_s2   # (B, T)
+    pi_c = ctx.student_topk_probs  # (B, T, K)
+
+    # pi_a: student prob at the sampled token, already available pre-computed
+    pi_a = ctx.student_log_prob_at_sampled.exp()  # (B, T)
+
+    teacher_ids = ctx.teacher_topk_ids              # (B, T, K)
+    teacher_probs = ctx.teacher_topk_logprobs.exp()  # (B, T, K)
+
+    # Top-p nucleus: include token k if cumulative mass before it is still < teacher_top_p.
+    # teacher_topk_logprobs are sorted descending, so cumsum is monotonically increasing.
+    shifted_cumsum = torch.cat(
+        [torch.zeros_like(teacher_probs[..., :1]), teacher_probs.cumsum(dim=-1)[..., :-1]],
+        dim=-1,
+    )  # (B, T, K)
+    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K); top-1 always True
+
     sampled_ids = ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, 1)
-    in_teacher_topk = (ctx.teacher_topk_ids == sampled_ids).any(dim=-1)  # (B, T)
-    
-    # Coverage score: teacher probability if in top-k, else 0
-    coverage_scores = torch.where(in_teacher_topk, teacher_prob_at_sampled, torch.zeros_like(teacher_prob_at_sampled))
-    
-    # Apply adaptive threshold
-    pg_mask = coverage_scores < adaptive_threshold
-    
+    sampled_in_teacher_topp = (teacher_ids == sampled_ids) & teacher_candidate  # (B, T, K)
+    sampled_in_teacher_topp = sampled_in_teacher_topp.any(dim=-1)  # (B, T)
+
+    # k1 = log pi_T(a) - log pi_S(a): positive when teacher favors a more than student
+    k1 = -ctx.k1_per_token  # (B, T)
+    positive_adv = k1 > adv_eps
+    negative_adv = k1 < -adv_eps
+
+    # Rule 1: student probability on teacher token c is too low
+    low_student_coverage = pi_c < student_low_threshold  # (B, T, K)
+
+    # Rule 2: k1 < 0 (student overrates a) — RL cannot reliably raise pi_c
+    negative_rl_cannot_help_c = (
+        negative_adv.unsqueeze(-1)
+        & ((pi_a.unsqueeze(-1) + pi_c) <= s2.unsqueeze(-1))
+    )  # (B, T, K)
+
+    # Rule 3: k1 > 0, a not in teacher top-p — PG for a squeezes out c
+    positive_pg_hurts_c = (
+        positive_adv.unsqueeze(-1)
+        & (~sampled_in_teacher_topp).unsqueeze(-1)
+        & ((pi_a.unsqueeze(-1) + pi_c) >= s2.unsqueeze(-1))
+    )  # (B, T, K)
+
+    need_fkl_per_c = torch.zeros_like(teacher_candidate, dtype=torch.bool)
+    if use_low_coverage_rule:
+        need_fkl_per_c |= low_student_coverage
+    if use_negative_rule:
+        need_fkl_per_c |= negative_rl_cannot_help_c
+    if use_positive_rule:
+        need_fkl_per_c |= positive_pg_hurts_c
+
+    need_fkl_per_c &= teacher_candidate  # only apply to active teacher candidates
+
+    # Any qualifying teacher candidate forces the position to FKL
+    pg_mask = ~need_fkl_per_c.any(dim=-1)  # (B, T)
+
     return pg_mask
