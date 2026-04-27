@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
-
+export CUDA_VISIBLE_DEVICES=6,7
 ############################ Quick Config ############################
 
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=/projects/standard/mhong/zhan9359/.cache/models--lzy337--lzy-qwen3-4b-base-sft-openthoughts3/snapshots/a98674ef81116f7255d223043e18be109a2fb594
-TEACHER_MODEL=Qwen/Qwen3-8B
+STUDENT_MODEL=XinnanZhang/Qwen3-1.7B-Base-Openthought400K-SFT-1epoch
+TEACHER_MODEL=Qwen/Qwen3-4B
 
 # USE_POLICY_GRADIENT=False
 # DISTILLATION_LOSS_MODE="k3"
-# DISTILLATION_LOSS_MODE="forward_kl_topk"
+DISTILLATION_LOSS_MODE="forward_kl_topk"
 # USE_FUSED_KERNELS=False
 
-USE_POLICY_GRADIENT=True
-DISTILLATION_LOSS_MODE="k1"
+USE_POLICY_GRADIENT=False
+# DISTILLATION_LOSS_MODE="k1"
 USE_FUSED_KERNELS=False
 
 DISTILLATION_LOSS_MAX_CLAMP=10.0
@@ -32,10 +32,10 @@ STUDENT_MICRO_BATCH_SIZE_PER_GPU=2
 STUDENT_MAX_TOKEN_LEN_PER_GPU=$(( STUDENT_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT + MAX_RESPONSE_LENGTH) ))
 USE_DYNAMIC_BSZ=True
 
-STUDENT_WORLD_SIZE=4
+STUDENT_WORLD_SIZE=2
 
 TEACHER_RESOURCE_POOL=False
-TEACHER_WORLD_SIZE=4
+TEACHER_WORLD_SIZE=2
 
 SP=1
 
@@ -44,14 +44,11 @@ EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLA
 ENFORCE_EAGER=True # true for faster debugging
 
 ############################ Paths ############################
-DATA_PATH="/projects/standard/mhong/zhan9359/verl/data"
-# gsm8k_train_path=$DATA_PATH/gsm8k/train.parquet
-# gsm8k_test_path=$DATA_PATH/gsm8k/test.parquet
+# Pre-download with: bash examples/data_preprocess/download_dapo_17k_aime.sh
+DATA_PATH="/mnt/data1/zhan9359/data/dapo_17k_aime"
 
-# DAPO_TRAIN_PATH=$DATA_PATH/dapo-math-17k-boxed-dedup.parquet
-# DAPO_TEST_PATH=$DATA_PATH/aime-eval.parquet
-DAPO_TRAIN_PATH=$DATA_PATH/dapo-math-17k-boxed-dedup-problem-only.parquet
-DAPO_TEST_PATH=$DATA_PATH/aime-eval-problem-only.parquet
+DAPO_TRAIN_PATH=$DATA_PATH/train.parquet
+DAPO_TEST_PATH=$DATA_PATH/test.parquet
 
 TRAIN_FILES="['$DAPO_TRAIN_PATH']"
 TEST_FILES="['$DAPO_TEST_PATH']"
@@ -124,7 +121,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$USE_DYNAMIC_BSZ
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.name=$ROLLOUT_NAME
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7
     actor_rollout_ref.rollout.calculate_log_probs=False
     actor_rollout_ref.rollout.max_model_len=$MAX_NUM_TOKENS
     actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_NUM_TOKENS
@@ -134,6 +131,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=8
 )
 
 ALGORITHM=(
@@ -145,13 +143,13 @@ ALGORITHM=(
 )
 
 TRAINER=(
-    trainer.logger='["console","wandb"]'
+    trainer.logger='["console"]'
     trainer.project_name=$PROJECT_NAME
     trainer.experiment_name=$EXP_NAME
     trainer.n_gpus_per_node=$STUDENT_WORLD_SIZE
     trainer.nnodes=1
     trainer.save_freq=-1
-    trainer.test_freq=10
+    trainer.test_freq=20
     trainer.total_epochs=5
     trainer.val_before_train=True
     trainer.use_legacy_worker_impl=disable

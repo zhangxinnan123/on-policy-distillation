@@ -80,12 +80,18 @@ pre-commit run --all-files --show-diff-on-failure --color=always ruff
 pre-commit run --all-files --show-diff-on-failure --color=always autogen-trainer-cfg
 ```
 
+The `autogen-trainer-cfg` hook regenerates `verl/trainer/config/_generated_*.yaml` from config dataclasses (via `scripts/generate_trainer_config.sh`). Run it manually after adding or renaming fields in any config dataclass under `verl/workers/config/` or `verl/trainer/config/`.
+
+The `check-docs-time-info` hook enforces that any modified `.md` file under `docs/` contains a `Last updated:` line. Update that field whenever you edit documentation.
+
 ### Tests
 
 ```bash
-# CPU tests (no GPU required) — match files ending in *_on_cpu.py
+# Run ALL CPU tests (no GPU required) — files ending in *_on_cpu.py
+pytest tests/ -k "_on_cpu"
+
+# Run a single CPU test file
 pytest tests/test_protocol_on_cpu.py
-pytest tests/test_base_config_on_cpu.py
 
 # Run a specific GPU test
 pytest tests/workers/test_some_worker.py
@@ -183,18 +189,26 @@ Key config groups:
 
 ### On-policy distillation
 
-This fork adds on-policy knowledge distillation. Enabled via `distillation.enabled=True`. Key components:
+This fork adds on-policy knowledge distillation. There are two separate distillation paths:
 
-- **`verl/trainer/distillation/losses.py`**: Distillation loss functions (k1/k3/forward_kl_topk and others). New loss modes are registered via `DistillationLossSettings`.
-- **`verl/trainer/distillation/fsdp/`** and **`verl/trainer/distillation/megatron/`**: Backend-specific distillation actor implementations.
-- **`verl/experimental/teacher_loop/teacher_manager.py`** (`TeacherModelManager`): Manages a pool of async vLLM/SGLang teacher inference servers (via `AsyncLLMServerManager`). Returns top-k log-probs + token indices per sequence.
+**Path 1 — FSDP/Megatron general path** (standard, use this for most cases):
+Enabled via `distillation.enabled=True` in `main_ppo.py`. Key components:
+
+- **`verl/trainer/distillation/losses.py`**: Loss registry. New loss modes are added via `@register_distillation_loss(DistillationLossSettings(...))`.
+- **`verl/trainer/distillation/fsdp/`** and **`verl/trainer/distillation/megatron/`**: Backend-specific forward KL top-k kernel implementations.
+- **`verl/experimental/teacher_loop/teacher_manager.py`** (`TeacherModelManager`): Manages a pool of async vLLM/SGLang teacher inference servers. Returns top-k log-probs + token indices per sequence.
 - **`verl/workers/config/distillation.py`** (`DistillationConfig`, `DistillationLossConfig`, `DistillationTeacherModelConfig`): All distillation configuration dataclasses.
 
+**Path 2 — Megatron async recipe** (higher throughput, overlaps rollout/teacher/update phases):
+Uses `recipe/gkd/` (submodule; init with `git submodule update --init --recursive recipe`) and `python3 -m recipe.gkd.main_gkd`. See `docs/advance/async-on-policy-distill.md` for the scheduler design (`one_step_off` / `two_step_off`). Requires a running teacher ZeroMQ server (`recipe/gkd/teacher/start_server.sh`).
+
 The distillation config (`verl/trainer/config/distillation/distillation.yaml`) controls:
-- `loss_mode`: `k1`, `k3`, `forward_kl_topk`, etc.
-- `topk`: number of top-k teacher logits
+- `loss_mode`: choose between two families:
+  - `forward_kl_topk` — forward KL using the full top-k teacher distribution; requires `topk > 1` teacher logprobs per token
+  - `k1`, `k3`, `kl`, `abs`, `mse`, `k2`, `low_var_kl` — single-sample KL estimators; only need 1 teacher logprob (set `topk: 1`)
+- `topk`: number of top-k teacher logits (only meaningful for `forward_kl_topk`)
 - `use_task_rewards`: combine distillation loss with RL reward
-- `use_policy_gradient`: use distillation as reward signal with policy gradient
+- `use_policy_gradient`: treat negative distillation loss as advantage signal instead of direct supervised loss
 - `teacher_model.*`: teacher inference server configuration
 
 Example script: `examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh`
