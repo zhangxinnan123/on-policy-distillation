@@ -187,32 +187,44 @@ def _mask_coverage_threshold(ctx: HybridMaskContext) -> torch.Tensor:
 
 @register_mask("opd_theory_guided")
 def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
-    """Theory-guided OPD routing based on the sign of the per-token k1 advantage.
+    """Theory-guided OPD routing using the per-candidate desired direction vs PG direction.
 
-    Uses k1 = log pi_T(a) - log pi_S(a) as the advantage signal (positive means
-    teacher favors a more than student), ctx.student_topk_probs for pi_c, and
-    ctx.student_s2 for the collision probability.
+    Uses k1 = log pi_T(a) - log pi_S(a) at the sampled token (positive ⇒ teacher
+    favors a more than student), ctx.student_topk_probs for pi_c, and ctx.student_s2
+    for the collision probability.
 
-    Returns pg_mask (B, T): True → PG/RL arm, False → FKL / teacher top-p arm.
+    Returns pg_mask (B, T): True → PG/RL arm, False → FKL supervised arm.
 
-    Routing logic (a = sampled token, c = teacher top-p candidate, S2 = Σ_b pi_S(b)²):
+    Per-candidate definitions (c = teacher top-p candidate):
+      want_increase_c   = pi_T(c) > pi_S(c)           (teacher wants pi_c higher than now)
+      pg_raises_c       = +1 if PG step on a will raise pi_c, else -1.
+                          For c == a: same sign as k1(a). For c != a: opposite of k1(a)
+                          (mass redistribution).
+      direction_conflict = (want_increase_c) ⊕ (pg_raises_c is True)
+      mass_redistribute_strong = pi_a + pi_c ≥ S2     (PG step substantially moves pi_c)
+      mass_redistribute_weak   = pi_a + pi_c ≤ S2     (PG step barely moves pi_c)
 
-      Rule 1 (low-coverage):  pi_c < student_low_threshold  → FKL
-      Rule 2 (negative k1):   k1(a) < 0 and pi_a + pi_c ≤ S2  → FKL
-                               (student overrates a; RL cannot reliably raise pi_c)
-      Rule 3 (positive k1):   k1(a) > 0, a ∉ teacher top-p, pi_a + pi_c ≥ S2  → FKL
-                               (optimizing non-teacher token a would squeeze out c)
+    Routing rules (per candidate c, OR-aggregated across c at each position):
 
-    If any teacher-candidate c at a position triggers a FKL rule, the whole
+      Rule 1 (bootstrap):       pi_c < student_low_threshold and want_increase_c
+                                 ⇒ FKL needed because PG can't grow pi_c from ~0.
+      Rule 2 (magnitude weak):  direction_agree and mass_redistribute_weak
+                                 ⇒ PG direction is right but it's too weak to fix pi_c
+                                   (covers want-raise and want-lower cases symmetrically).
+      Rule 3 (wrong direction): direction_conflict and mass_redistribute_strong
+                                 ⇒ PG actively pushes pi_c the wrong way with non-trivial
+                                   magnitude — FKL overrides.
+
+    If any teacher candidate c (within top-p nucleus) triggers a rule, the whole
     position routes to FKL.
 
     Strategy kwargs:
       student_low_threshold (float, default 1e-3)
       teacher_top_p (float, default 0.9): nucleus probability mass for teacher candidates
       adv_eps (float, default 0.0): dead-zone around zero for k1 sign
-      use_low_coverage_rule (bool, default True)
-      use_negative_rule (bool, default True)
-      use_positive_rule (bool, default True)
+      use_low_coverage_rule (bool, default True): gates Rule 1 (bootstrap)
+      use_negative_rule (bool, default True):     gates Rule 2 (magnitude weak)
+      use_positive_rule (bool, default True):     gates Rule 3 (wrong direction)
 
     Requires ctx.student_topk_probs (B, T, K) and ctx.student_s2 (B, T) to be populated.
     Both are computed by compute_forward_kl_topk in fsdp/losses.py (FSDP backend only).
@@ -224,7 +236,7 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
             "in fsdp/losses.py (FSDP backend only)."
         )
 
-    student_low_threshold = float(ctx.mask_kwargs.get("student_low_threshold", 1e-3))
+    student_low_threshold = float(ctx.mask_kwargs.get("student_low_threshold", 1e-2))
     teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
     adv_eps = float(ctx.mask_kwargs.get("adv_eps", 0.0))
     use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
@@ -249,37 +261,54 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K); top-1 always True
 
     sampled_ids = ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, 1)
-    sampled_in_teacher_topp = (teacher_ids == sampled_ids) & teacher_candidate  # (B, T, K)
-    sampled_in_teacher_topp = sampled_in_teacher_topp.any(dim=-1)  # (B, T)
+    sampled_at_c = teacher_ids == sampled_ids  # (B, T, K) True where candidate slot is the sampled token
 
     # k1 = log pi_T(a) - log pi_S(a): positive when teacher favors a more than student
     k1 = -ctx.k1_per_token  # (B, T)
-    positive_adv = k1 > adv_eps
-    negative_adv = k1 < -adv_eps
+    k1_b = k1.unsqueeze(-1)  # (B, T, 1)
 
-    # Rule 1: student probability on teacher token c is too low
-    low_student_coverage = pi_c < student_low_threshold  # (B, T, K)
+    # Per-c desired direction: positive ⇒ teacher wants pi_c higher than student currently has it.
+    want_increase_c = teacher_probs > pi_c  # (B, T, K)
 
-    # Rule 2: k1 < 0 (student overrates a) — RL cannot reliably raise pi_c
-    negative_rl_cannot_help_c = (
-        negative_adv.unsqueeze(-1)
-        & ((pi_a.unsqueeze(-1) + pi_c) <= s2.unsqueeze(-1))
-    )  # (B, T, K)
+    # Per-c direction PG actually pushes pi_c.
+    #   c == a (sampled token):           PG raises pi_c iff k1(a) > 0
+    #   c != a (non-sampled candidate):   PG raises pi_c iff k1(a) < 0  (mass redistributed away from a)
+    pg_raises_c = torch.where(sampled_at_c, k1_b > adv_eps, k1_b < -adv_eps)  # (B, T, K)
+    pg_lowers_c = torch.where(sampled_at_c, k1_b < -adv_eps, k1_b > adv_eps)  # (B, T, K)
 
-    # Rule 3: k1 > 0, a not in teacher top-p — PG for a squeezes out c
-    positive_pg_hurts_c = (
-        positive_adv.unsqueeze(-1)
-        & (~sampled_in_teacher_topp).unsqueeze(-1)
-        & ((pi_a.unsqueeze(-1) + pi_c) >= s2.unsqueeze(-1))
-    )  # (B, T, K)
+    # Direction match between desired and actual PG update on pi_c.
+    direction_conflict = (want_increase_c & pg_lowers_c) | (~want_increase_c & pg_raises_c)
+    direction_agree = (want_increase_c & pg_raises_c) | (~want_increase_c & pg_lowers_c)
+
+    # Magnitude of PG's effect on pi_c via mass redistribution.
+    #   pi_a + pi_c >= s2  ⇒ a and c together dominate student's collision mass; PG step on a
+    #                        substantially shifts pi_c (large magnitude).
+    #   pi_a + pi_c <= s2  ⇒ other student peaks dominate; PG step on a barely moves pi_c
+    #                        (small magnitude — direction may be right but won't be enough).
+    mass_redistribute_strong = (pi_a.unsqueeze(-1) + pi_c) >= s2.unsqueeze(-1)
+    mass_redistribute_weak = (pi_a.unsqueeze(-1) + pi_c) <= s2.unsqueeze(-1)
+
+    # Rule 1 (bootstrap): student probability on a teacher candidate is essentially zero
+    # and teacher does want it higher. PG via mass redistribution can't grow from ~0 fast
+    # enough — FKL needed to get off the floor.
+    low_student_coverage = (pi_c < student_low_threshold) & want_increase_c  # (B, T, K)
+
+    # Rule 2 (magnitude failure): PG direction agrees with desired direction, but the
+    # mass redistribution route is too weak to actually move pi_c. Bidirectional —
+    # covers both "want raise but PG too weak to raise" and "want lower but PG too weak to lower".
+    pg_too_weak = direction_agree & mass_redistribute_weak  # (B, T, K)
+
+    # Rule 3 (direction conflict): PG actively pushes pi_c in the wrong direction and the
+    # mass redistribution is large enough to actually do harm.
+    pg_pushes_wrong = direction_conflict & mass_redistribute_strong  # (B, T, K)
 
     need_fkl_per_c = torch.zeros_like(teacher_candidate, dtype=torch.bool)
     if use_low_coverage_rule:
         need_fkl_per_c |= low_student_coverage
     if use_negative_rule:
-        need_fkl_per_c |= negative_rl_cannot_help_c
+        need_fkl_per_c |= pg_too_weak
     if use_positive_rule:
-        need_fkl_per_c |= positive_pg_hurts_c
+        need_fkl_per_c |= pg_pushes_wrong
 
     need_fkl_per_c &= teacher_candidate  # only apply to active teacher candidates
 

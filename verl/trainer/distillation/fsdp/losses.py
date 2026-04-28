@@ -126,6 +126,10 @@ def compute_forward_kl_topk(
         for j in _overlap_thresholds(topk):
             outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
             outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
+            # L1 distance |p_S - p_T| summed over teacher's top-j positions.
+            outputs[f"abs_diff_at_{j}"] = (
+                student_probs_at_teacher[..., :j] - teacher_probs_topk[..., :j]
+            ).abs().sum(dim=-1)
             s_j = student_topk_ids[..., :j]
             t_j_sorted, sort_idx = teacher_topk_ids[..., :j].sort(dim=-1)
             teacher_lp_sorted_j = teacher_topk_log_probs[..., :j].gather(-1, sort_idx)
@@ -382,6 +386,10 @@ def compute_student_topk_overlap_k1(
         for j in _overlap_thresholds(topk):
             outputs[f"student_mass_at_{j}"] = student_probs_at_teacher[..., :j].sum(dim=-1)
             outputs[f"teacher_mass_at_{j}"] = teacher_probs_topk[..., :j].sum(dim=-1)
+            # L1 distance |p_S - p_T| summed over teacher's top-j positions.
+            outputs[f"abs_diff_at_{j}"] = (
+                student_probs_at_teacher[..., :j] - teacher_probs_topk[..., :j]
+            ).abs().sum(dim=-1)
 
             # Symmetric top-j overlap via binary search — avoids the (1, T, j, j) bool.
             s_j = student_topk_ids[..., :j]

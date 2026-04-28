@@ -396,6 +396,14 @@ def distillation_loss(
             **loss_config.global_batch_info,
         )
 
+    # Strip internal hybrid-routing keys before returning. They were stashed on
+    # model_output to communicate between the registered loss and the combine path
+    # above; the engine's postprocess_batch_func then iterates every key and calls
+    # `.unbind()`, which fails on the non-tensor `_hybrid_combine_mode` (a string).
+    for _k in list(model_output.keys()):
+        if _k.startswith("_hybrid_"):
+            del model_output[_k]
+
     return distillation_loss, distillation_metrics
 
 
@@ -602,6 +610,7 @@ def compute_forward_kl_topk(
         for prefix in (
             "student_mass_at_",
             "teacher_mass_at_",
+            "abs_diff_at_",
             "overlap_ratio_at_",
             "overlap_student_mass_at_",
             "overlap_teacher_mass_at_",
@@ -682,6 +691,7 @@ def compute_k1_pg_fkl_topk(
         for prefix in (
             "student_mass_at_",
             "teacher_mass_at_",
+            "abs_diff_at_",
             "overlap_ratio_at_",
             "overlap_student_mass_at_",
             "overlap_teacher_mass_at_",
@@ -885,6 +895,7 @@ def compute_k1_topk_overlap(
         for prefix in (
             "student_mass_at_",
             "teacher_mass_at_",
+            "abs_diff_at_",
             "overlap_ratio_at_",
             "overlap_student_mass_at_",
             "overlap_teacher_mass_at_",
