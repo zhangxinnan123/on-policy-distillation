@@ -25,6 +25,7 @@ def _worker(
     row_indices: List[int],
     items: List[Dict],
     tmp_path: str,
+    chat_template_kwargs: Dict[str, Any] | None = None,
 ) -> None:
     """Single-GPU worker: loads model, generates its slice, writes to tmp_path."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -33,7 +34,10 @@ def _worker(
     sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature, top_p=top_p, n=n)
 
     print(f"[GPU {gpu_id}] generating {len(conversations)} prompts ...")
-    outputs: List[Any] = llm.chat(messages=conversations, sampling_params=sampling_params) or []
+    outputs: List[Any] = llm.chat(
+        messages=conversations, sampling_params=sampling_params,
+        **({"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}),
+    ) or []
 
     with open(tmp_path, "w", encoding="utf-8") as f:
         for row_idx, item, output in zip(row_indices, items, outputs):
@@ -76,6 +80,12 @@ def main() -> None:
              "0 = auto from CUDA_VISIBLE_DEVICES. Overrides --tp to 1 per worker.",
     )
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "auto"], help="Model dtype (default: bfloat16).")
+    p.add_argument(
+        "--enable_thinking",
+        type=lambda x: x.lower() not in ("false", "0", "no"),
+        default=None,
+        help="Pass enable_thinking to chat_template_kwargs (true/false). Default: not set (model default).",
+    )
     args = p.parse_args()
 
     # Resolve available GPU IDs
@@ -116,14 +126,21 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{stamp}_t{args.temperature}_p{args.top_p}_results.jsonl"
 
+    chat_template_kwargs: Dict[str, Any] = {}
+    if args.enable_thinking is not None:
+        chat_template_kwargs["enable_thinking"] = args.enable_thinking
+
     if not use_dp:
         # Single worker path
         llm = LLM(model=args.model, tensor_parallel_size=tp, max_model_len=args.max_model_len, dtype=args.dtype)
         sampling_params = SamplingParams(
             max_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p, n=args.n
         )
-        print(f"[INFO] Generating {limit} prompts × n={args.n} ...")
-        outputs: List[Any] = llm.chat(messages=conversations, sampling_params=sampling_params) or []
+        print(f"[INFO] Generating {limit} prompts × n={args.n} (enable_thinking={args.enable_thinking}) ...")
+        outputs: List[Any] = llm.chat(
+            messages=conversations, sampling_params=sampling_params,
+            **({"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}),
+        ) or []
 
         with out_path.open("w", encoding="utf-8") as f:
             for row_idx, (item, output) in enumerate(zip(items, outputs)):
@@ -160,6 +177,7 @@ def main() -> None:
                     gid, args.model, args.max_model_len, args.max_new_tokens,
                     args.temperature, args.top_p, args.n, args.dtype,
                     chunks[w], indices[w], chunk_items[w], tmp_paths[w],
+                    chat_template_kwargs or None,
                 ),
             )
             proc.start()
