@@ -7,15 +7,21 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Per-token mask strategies for hybrid PG + supervised distillation losses.
 
-Each strategy returns a boolean tensor of shape (bsz, seqlen) where True means
-"use the PG arm at this position" and False means "use the supervised arm".
-The framework ANDs the returned mask with `response_mask` before use, and
-derives `sup_mask = response_mask & ~pg_mask`, guaranteeing the two sub-masks
-are disjoint and together cover exactly the valid response tokens.
+A strategy returns either:
+  - a single bool tensor (B, T): True → PG arm, False → supervised arm. The
+    caller derives sup_mask = response_mask & ~pg_mask, so every valid
+    response token is routed to one of the two arms.
+  - a tuple (pg_mask, sup_mask), both bool (B, T): the caller uses them as-is
+    after ANDing with response_mask. Tokens in neither mask are *dropped* —
+    they contribute to no loss. Used by strategies where some positions
+    should receive no update at all (e.g. opd_theory_guided with
+    conflict_action="drop").
+
+In either form, pg_mask and sup_mask must be disjoint subsets of response_mask.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -50,7 +56,8 @@ class HybridMaskContext:
     mask_kwargs: dict = field(default_factory=dict)
 
 
-MaskFn = Callable[[HybridMaskContext], torch.Tensor]
+MaskReturn = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+MaskFn = Callable[[HybridMaskContext], MaskReturn]
 MASK_REGISTRY: dict[str, MaskFn] = {}
 
 
@@ -321,3 +328,94 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     pg_mask = ~need_fkl_per_c.any(dim=-1)  # (B, T)
 
     return pg_mask
+
+
+@register_mask("opd_drop_conflict")
+def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
+    """Drop positions where the PG step is predicted to increase RKL on the
+    teacher nucleus.
+
+    Per teacher-nucleus candidate c, build a signed proxy for the PG-induced
+    change in pi_S:
+
+        c == a:  Δpi(a) ∝ k1 · pi_a · (1 − 2·pi_a + S2)        (bracket ≥ 0)
+        c != a:  Δpi(c) ∝ k1 · pi_c · (S2 − pi_a − pi_c)
+
+    where k1 = log pi_T(a) − log pi_S(a). The signed score is
+
+        score = Σ_{c ∈ nucleus} (log pi_T(c) − log pi_S(c)) · Δpi_proxy(c)
+
+    Using Σ_c Δpi(c) = 0 (over full vocab), this equals −Δ D_KL(pi_S || pi_T)
+    to first order in the PG step (restricted to the nucleus). Sign:
+      score > 0  →  PG decreases RKL on the nucleus (helpful)
+      score < 0  →  PG increases RKL on the nucleus (harmful)
+
+    Drop iff score < drop_threshold. With drop_threshold=0, drop net-harmful
+    positions. Higher thresholds additionally drop weakly-helpful positions.
+    Remaining positions get the PG (k1) update. No FKL arm.
+
+    Strategy kwargs:
+      teacher_top_p (float, default 0.95): nucleus mass for teacher candidates.
+      drop_threshold (float, default 0.0): drop iff score < threshold. Tune
+        via `distillation/dropped_token_ratio`.
+    """
+
+    if ctx.student_topk_probs is None or ctx.student_s2 is None:
+        raise ValueError(
+            "opd_drop_conflict requires student_topk_probs and student_s2 in "
+            "HybridMaskContext. These are populated by compute_forward_kl_topk "
+            "in fsdp/losses.py (FSDP backend only)."
+        )
+
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.95))
+    drop_threshold = float(ctx.mask_kwargs.get("drop_threshold", 0.0))
+
+    s2 = ctx.student_s2  # (B, T)
+    pi_c = ctx.student_topk_probs  # (B, T, K)
+    pi_a = ctx.student_log_prob_at_sampled.exp()  # (B, T)
+
+    teacher_ids = ctx.teacher_topk_ids  # (B, T, K)
+    teacher_logp = ctx.teacher_topk_logprobs  # (B, T, K)
+    teacher_probs = teacher_logp.exp()  # (B, T, K)
+
+    # Teacher candidate set: top-p nucleus inside teacher top-k.
+    shifted_cumsum = torch.cat(
+        [
+            torch.zeros_like(teacher_probs[..., :1]),
+            teacher_probs.cumsum(dim=-1)[..., :-1],
+        ],
+        dim=-1,
+    )
+    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K)
+
+    sampled_at_c = teacher_ids == ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, K)
+
+    # k1 = log pi_T(a) - log pi_S(a). ctx.k1_per_token is the negation.
+    k1_b = (-ctx.k1_per_token).unsqueeze(-1)  # (B, T, 1)
+    pi_a_b = pi_a.unsqueeze(-1)  # (B, T, 1)
+    s2_b = s2.unsqueeze(-1)  # (B, T, 1)
+
+    # Signed proxy for Δpi(c), amplitude-aware (modulo positive learning-rate scalar).
+    # c == a:  Δpi(a) ∝ k1 · pi_a · (1 − 2·pi_a + S2)         — bracket always ≥ 0
+    # c != a:  Δpi(c) ∝ k1 · pi_c · (S2 − pi_a − pi_c)
+    bracket_at = 1.0 - 2.0 * pi_a_b + s2_b
+    bracket_off = s2_b - pi_a_b - pi_c
+    delta_pi_proxy = torch.where(
+        sampled_at_c,
+        k1_b * pi_a_b * bracket_at,
+        k1_b * pi_c * bracket_off,
+    )  # (B, T, K)
+
+    # Per-candidate log-ratio. log pi_S at teacher candidates derived from pi_c.
+    log_pi_s_c = pi_c.clamp_min(1e-20).log()  # (B, T, K)
+    log_ratio = teacher_logp - log_pi_s_c  # (B, T, K)
+
+    contrib = log_ratio * delta_pi_proxy  # (B, T, K)
+    contrib = contrib * teacher_candidate.float()  # restrict to nucleus
+
+    score = contrib.sum(dim=-1)  # (B, T)
+    drop_pos = score < drop_threshold  # (B, T)
+
+    pg_mask = ~drop_pos
+    sup_mask = torch.zeros_like(pg_mask)
+    return pg_mask, sup_mask

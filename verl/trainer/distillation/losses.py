@@ -761,12 +761,27 @@ def compute_k1_pg_fkl_topk(
         mask_kwargs=dict(loss_config.hybrid_mask_kwargs) if loss_config.hybrid_mask_kwargs else {},
     )
     mask_fn = get_mask_fn(loss_config.hybrid_mask_strategy)
-    pg_mask_raw = mask_fn(ctx)
-    assert pg_mask_raw.shape == response_mask_bool.shape, (
-        f"Mask strategy returned {pg_mask_raw.shape}, expected {response_mask_bool.shape}"
-    )
-    pg_mask = pg_mask_raw.bool() & response_mask_bool
-    sup_mask = response_mask_bool & ~pg_mask
+    mask_result = mask_fn(ctx)
+    if isinstance(mask_result, tuple):
+        # Strategy returned (pg_mask, sup_mask) explicitly. Tokens in neither
+        # mask are dropped from both arms (no PG, no FKL contribution).
+        pg_mask_raw, sup_mask_raw = mask_result
+        assert pg_mask_raw.shape == sup_mask_raw.shape == response_mask_bool.shape, (
+            f"Mask strategy returned ({pg_mask_raw.shape}, {sup_mask_raw.shape}), "
+            f"expected both {response_mask_bool.shape}"
+        )
+        pg_mask = pg_mask_raw.bool() & response_mask_bool
+        sup_mask = sup_mask_raw.bool() & response_mask_bool
+        assert not (pg_mask & sup_mask).any(), (
+            "Mask strategy returned overlapping pg_mask and sup_mask"
+        )
+    else:
+        pg_mask_raw = mask_result
+        assert pg_mask_raw.shape == response_mask_bool.shape, (
+            f"Mask strategy returned {pg_mask_raw.shape}, expected {response_mask_bool.shape}"
+        )
+        pg_mask = pg_mask_raw.bool() & response_mask_bool
+        sup_mask = response_mask_bool & ~pg_mask
 
     # Stash tensors for the outer combine path. Using "_hybrid_*" keys to signal
     # intra-module coupling (see distillation_loss() for the reader side).
@@ -784,6 +799,10 @@ def compute_k1_pg_fkl_topk(
     total = response_mask_bool.sum().clamp(min=1)
     distillation_metrics["distillation/pg_token_ratio"] = Metric(
         AggregationType.MEAN, pg_mask.sum().float() / total.float()
+    )
+    dropped_mask = response_mask_bool & ~pg_mask & ~sup_mask
+    distillation_metrics["distillation/dropped_token_ratio"] = Metric(
+        AggregationType.MEAN, dropped_mask.sum().float() / total.float()
     )
     # Record raw k1 without abs to preserve sign information
     distillation_metrics["distillation/mean_k1"] = Metric(
