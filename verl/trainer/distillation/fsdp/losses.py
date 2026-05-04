@@ -144,6 +144,88 @@ def compute_forward_kl_topk(
     return outputs
 
 
+def compute_jsd_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: "DistillationConfig",
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Generalized JSD on teacher's top-K support, with both distributions
+    renormalized over K so each sums to 1.
+
+        log p_T = teacher_topk_log_probs - logsumexp(teacher_topk_log_probs)
+        log p_S = student_logits.gather(teacher_topk_ids) - logsumexp(...)
+        M       = beta * p_T + (1-beta) * p_S
+        JSD_b   = beta * KL(p_T || M) + (1-beta) * KL(p_S || M)
+
+    Full-vocab logsumexp is not needed for the loss (cancels under
+    K-renormalization); it is computed only for the `student_mass` /
+    `teacher_mass` health diagnostics.
+    """
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, T, K)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)              # (1, T, K)
+
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    loss_config: DistillationLossConfig = config.distillation_loss
+    beta = float(loss_config.jsd_beta)
+    assert 0.0 < beta < 1.0, f"jsd_beta must be in (0, 1) (got {beta})"
+
+    # --- Full-vocab quantities (for student_mass + parity tensors used by hybrid masks) ---
+    log_Z = student_logits.logsumexp(dim=-1, keepdim=True)                   # (1, T, 1)
+    student_topk_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_ids)
+    student_topk_log_probs_full = student_topk_logits - log_Z                 # full-vocab norm
+    teacher_probs_topk = teacher_topk_log_probs.exp()
+    student_mass = student_topk_log_probs_full.exp().sum(dim=-1)              # (1, T)
+    teacher_mass = teacher_probs_topk.sum(dim=-1)
+
+    # --- Renormalize over K-support for JSD math ---
+    log_p_T = teacher_topk_log_probs - teacher_topk_log_probs.logsumexp(dim=-1, keepdim=True)
+    log_p_S = student_topk_logits - student_topk_logits.logsumexp(dim=-1, keepdim=True)
+
+    # log M = log(beta * p_T + (1-beta) * p_S) via logaddexp.
+    log_beta = torch.log(torch.tensor(beta, device=log_p_T.device, dtype=log_p_T.dtype))
+    log_1mbeta = torch.log(torch.tensor(1.0 - beta, device=log_p_T.device, dtype=log_p_T.dtype))
+    log_M = torch.logaddexp(log_p_T + log_beta, log_p_S + log_1mbeta)        # (1, T, K)
+
+    # KL(p_T || M) and KL(p_S || M); use float32 for numerical stability.
+    p_T = log_p_T.exp().float()
+    p_S = log_p_S.exp().float()
+    log_M_f = log_M.float()
+    kl_T_M = (p_T * (log_p_T.float() - log_M_f)).sum(dim=-1)                 # (1, T)
+    kl_S_M = (p_S * (log_p_S.float() - log_M_f)).sum(dim=-1)
+    distillation_losses = beta * kl_T_M + (1.0 - beta) * kl_S_M
+
+    # --- Parity tensors for hybrid mask strategies (mirror compute_forward_kl_topk) ---
+    student_topk_probs = student_topk_log_probs_full.detach().exp()           # (1, T, K)
+    student_s2 = (
+        student_logits.detach().mul(2).logsumexp(dim=-1) - 2 * log_Z.detach().squeeze(-1)
+    ).exp()                                                                   # (1, T)
+    hybrid_kwargs = loss_config.hybrid_mask_kwargs or {}
+    top_p = float(hybrid_kwargs.get("top_p", 0.9))
+    cumsum = teacher_probs_topk.cumsum(dim=-1)
+    shifted = torch.cat([torch.zeros_like(cumsum[..., :1]), cumsum[..., :-1]], dim=-1)
+    in_top_p = shifted < top_p
+    coverage_scores = (student_topk_probs * in_top_p.float()).sum(dim=-1)
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "jsd_kl_T_M": kl_T_M,
+        "jsd_kl_S_M": kl_S_M,
+        "coverage_scores": coverage_scores,
+        "student_topk_probs": student_topk_probs,
+        "student_s2": student_s2,
+    }
+
+
 def compute_forward_kl_topk_approx(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,

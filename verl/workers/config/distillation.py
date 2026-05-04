@@ -85,6 +85,10 @@ class DistillationLossConfig(BaseConfig):
     hybrid_mask_strategy: str = "oot"
     hybrid_mask_kwargs: dict = field(default_factory=dict)
 
+    # Generalized JSD interpolation parameter for jsd_topk loss mode.
+    # M = beta * p_T + (1-beta) * p_S; beta=0.5 is symmetric JSD.
+    jsd_beta: float = 0.5
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch

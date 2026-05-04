@@ -330,6 +330,88 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     return pg_mask
 
 
+@register_mask("opd_aligned")
+def _mask_opd_aligned(ctx: HybridMaskContext) -> torch.Tensor:
+    """Aggregate PG-vs-teacher alignment score per position; route by sign.
+
+    First-order proxy for the PG-induced change in pi_S at candidate c (same
+    derivation as `opd_drop_conflict`):
+
+        c == a:  Delta pi(a) ∝ k1 * pi_a * (1 − 2*pi_a + S2)        (bracket ≥ 0)
+        c != a:  Delta pi(c) ∝ k1 * pi_c * (S2 − pi_a − pi_c)
+
+    where k1 = log pi_T(a) − log pi_S(a). Per-position alignment score:
+
+        score = Σ_{c ∈ teacher top-p} (log pi_T(c) − log pi_S(c)) * Delta pi_proxy(c)
+
+    Sign interpretation (Σ_c Delta pi(c) = 0 over full vocab):
+      score > 0  →  PG step *decreases* RKL on the nucleus on average  →  use PG (k1)
+      score ≤ 0  →  PG step would *increase* RKL on the nucleus       →  use supervised (FKL/JSD)
+
+    Differences:
+      - vs `opd_drop_conflict`: that strategy *drops* conflicting positions
+        (no gradient at all); this one routes them to the supervised arm so
+        they still contribute a gradient via FKL or JSD.
+      - vs `opd_theory_guided`: that one is conservative (any single
+        misaligned candidate triggers supervised); this one is aggregate (a
+        single misaligned candidate can be outweighed by many aligned ones).
+
+    Strategy kwargs:
+      teacher_top_p (float, default 0.95): nucleus mass for teacher candidates.
+      score_eps (float, default 0.0): dead-zone; route to supervised if
+        score ≤ score_eps. Tune via `distillation/pg_token_ratio`.
+    """
+    if ctx.student_topk_probs is None or ctx.student_s2 is None:
+        raise ValueError(
+            "opd_aligned requires student_topk_probs and student_s2 in "
+            "HybridMaskContext. These are populated by compute_forward_kl_topk "
+            "/ compute_jsd_topk in fsdp/losses.py (FSDP backend only)."
+        )
+
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.95))
+    score_eps = float(ctx.mask_kwargs.get("score_eps", 0.0))
+
+    s2 = ctx.student_s2  # (B, T)
+    pi_c = ctx.student_topk_probs  # (B, T, K)
+    pi_a = ctx.student_log_prob_at_sampled.exp()  # (B, T)
+
+    teacher_ids = ctx.teacher_topk_ids  # (B, T, K)
+    teacher_logp = ctx.teacher_topk_logprobs  # (B, T, K)
+    teacher_probs = teacher_logp.exp()  # (B, T, K)
+
+    shifted_cumsum = torch.cat(
+        [
+            torch.zeros_like(teacher_probs[..., :1]),
+            teacher_probs.cumsum(dim=-1)[..., :-1],
+        ],
+        dim=-1,
+    )
+    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K)
+
+    sampled_at_c = teacher_ids == ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, K)
+
+    k1_b = (-ctx.k1_per_token).unsqueeze(-1)  # (B, T, 1)
+    pi_a_b = pi_a.unsqueeze(-1)  # (B, T, 1)
+    s2_b = s2.unsqueeze(-1)  # (B, T, 1)
+
+    bracket_at = 1.0 - 2.0 * pi_a_b + s2_b
+    bracket_off = s2_b - pi_a_b - pi_c
+    delta_pi_proxy = torch.where(
+        sampled_at_c,
+        k1_b * pi_a_b * bracket_at,
+        k1_b * pi_c * bracket_off,
+    )  # (B, T, K)
+
+    log_pi_s_c = pi_c.clamp_min(1e-20).log()  # (B, T, K)
+    log_ratio = teacher_logp - log_pi_s_c  # (B, T, K)
+
+    contrib = log_ratio * delta_pi_proxy * teacher_candidate.float()  # (B, T, K)
+    score = contrib.sum(dim=-1)  # (B, T)
+
+    pg_mask = score > score_eps
+    return pg_mask
+
+
 @register_mask("opd_drop_conflict")
 def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
     """Drop positions where the PG step is predicted to increase RKL on the

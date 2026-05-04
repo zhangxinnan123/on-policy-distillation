@@ -153,6 +153,12 @@ def compute_topk_loss(
                 distillation_loss_fn = fsdp_losses.compute_student_topk_overlap_k1
             elif loss_mode == "forward_kl_topk_approx":
                 distillation_loss_fn = fsdp_losses.compute_forward_kl_topk_approx
+            elif loss_mode == "jsd_topk":
+                distillation_loss_fn = fsdp_losses.compute_jsd_topk
+            elif loss_mode == "k1_pg_jsd_topk":
+                # Hybrid mode reuses the jsd_topk kernel; the PG arm is computed
+                # later in the outer registered fn from teacher_next_token_logprobs.
+                distillation_loss_fn = fsdp_losses.compute_jsd_topk
             elif loss_mode == "k1_pg_fkl_topk":
                 # Hybrid mode reuses the forward_kl_topk kernel; the PG arm is
                 # computed later in the outer registered fn from the same teacher
@@ -166,6 +172,14 @@ def compute_topk_loss(
             if loss_mode == "forward_kl_topk_approx":
                 raise NotImplementedError(
                     "forward_kl_topk_approx is only implemented for the fsdp backend."
+                )
+            if loss_mode == "jsd_topk":
+                raise NotImplementedError(
+                    "jsd_topk is only implemented for the fsdp backend."
+                )
+            if loss_mode == "k1_pg_jsd_topk":
+                raise NotImplementedError(
+                    "k1_pg_jsd_topk is only implemented for the fsdp backend."
                 )
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
@@ -334,8 +348,10 @@ def distillation_loss(
                 value=fkl_loss.detach(), aggregation=AggregationType.MEAN
             )
         else:
-            # k1_pg_fkl_topk: PG arm on pg_mask, FKL supervised arm on sup_mask.
-            # Supervised arm: aggregate FKL per-token losses over sup_mask only. Using the
+            # k1_pg_fkl_topk / k1_pg_jsd_topk: PG arm on pg_mask, supervised arm on sup_mask.
+            # The supervised tensor is whatever the registered fn put in distillation_losses
+            # (per-token FKL or per-token JSD) — the combine path is identical.
+            # Supervised arm: aggregate per-token losses over sup_mask only. Using the
             # global response-token denominator (batch_num_tokens) so each arm's scalar
             # contribution scales naturally with its mask share.
             sup_loss = agg_loss(
@@ -632,6 +648,52 @@ def compute_forward_kl_topk(
 
 
 @register_distillation_loss(
+    DistillationLossSettings(names=["jsd_topk"], use_topk=True)
+)  # type: ignore[arg-type]
+def compute_jsd_topk(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Generalized JSD on teacher's top-K support (renormalized over K).
+
+    Both teacher and student top-K log-probs are renormalized so each sums to 1
+    on teacher's K-support. Loss = beta * KL(p_T || M) + (1-beta) * KL(p_S || M)
+    with M = beta * p_T + (1-beta) * p_S. Both KL terms are surfaced as
+    diagnostics so the per-side contribution is observable.
+
+    Loss is non-negative on proper distributions; no `clamp_min(0)` needed.
+    """
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    kl_T_M = no_padding_2_padding(model_output["jsd_kl_T_M"], data)
+    kl_S_M = no_padding_2_padding(model_output["jsd_kl_S_M"], data)
+    response_mask_bool = data["response_mask"].bool()
+    assert (
+        distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+    )
+
+    student_mass_m = student_mass[response_mask_bool]
+    teacher_mass_m = teacher_mass[response_mask_bool]
+    kl_T_M_m = kl_T_M[response_mask_bool]
+    kl_S_M_m = kl_S_M[response_mask_bool]
+    distillation_metrics = {
+        "distillation/student_mass": student_mass_m.mean().item(),
+        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass_m.min()),
+        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass_m.max()),
+        "distillation/teacher_mass": teacher_mass_m.mean().item(),
+        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass_m.min()),
+        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass_m.max()),
+        "distillation/jsd_kl_T_M": kl_T_M_m.mean().item(),
+        "distillation/jsd_kl_S_M": kl_S_M_m.mean().item(),
+        "distillation/jsd_beta": float(distillation_config.distillation_loss.jsd_beta),
+    }
+    return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(
     DistillationLossSettings(names=["k1_pg_fkl_topk"], use_topk=True, use_hybrid=True)
 )  # type: ignore[arg-type]
 def compute_k1_pg_fkl_topk(
@@ -851,6 +913,136 @@ def compute_k1_pg_fkl_topk(
             distillation_metrics["distillation/top_p_coverage_max"] = Metric(
                 AggregationType.MAX, valid_coverage.max()
             )
+
+    return sup_losses, distillation_metrics
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["k1_pg_jsd_topk"], use_topk=True, use_hybrid=True)
+)  # type: ignore[arg-type]
+def compute_k1_pg_jsd_topk(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Hybrid per-token partition of k1 PG and supervised jsd_topk.
+
+    Mirrors `compute_k1_pg_fkl_topk` but the supervised arm uses generalized JSD
+    on teacher's K-renormalized support (see `compute_jsd_topk`). Both KL halves
+    of the JSD are surfaced as diagnostics. The supervised tensor is non-negative
+    by construction so no `clamp_min(0)` is applied.
+    """
+    from verl.trainer.distillation.hybrid_masks import HybridMaskContext, get_mask_fn
+
+    # 1. Supervised JSD per-token losses + diagnostics from compute_jsd_topk.
+    sup_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    kl_T_M = no_padding_2_padding(model_output["jsd_kl_T_M"], data)
+    kl_S_M = no_padding_2_padding(model_output["jsd_kl_S_M"], data)
+    response_mask = data["response_mask"]
+    response_mask_bool = response_mask.bool()
+    assert sup_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+
+    distillation_metrics: dict[str, Any] = {
+        "distillation/student_mass": student_mass[response_mask_bool].mean().item(),
+        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass[response_mask_bool].min()),
+        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass[response_mask_bool].max()),
+        "distillation/teacher_mass": teacher_mass[response_mask_bool].mean().item(),
+        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass[response_mask_bool].min()),
+        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass[response_mask_bool].max()),
+        "distillation/jsd_kl_T_M": kl_T_M[response_mask_bool].mean().item(),
+        "distillation/jsd_kl_S_M": kl_S_M[response_mask_bool].mean().item(),
+        "distillation/jsd_beta": float(distillation_config.distillation_loss.jsd_beta),
+    }
+
+    loss_config = distillation_config.distillation_loss
+
+    # 2. Per-token k1 KL at the sampled token (same as k1_pg_fkl_topk).
+    student_lp_at_sampled = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_lp_at_sampled = no_padding_2_padding(data["teacher_next_token_logprobs"], data)
+    assert student_lp_at_sampled.shape == teacher_lp_at_sampled.shape == response_mask_bool.shape
+    k1_per_token = kl_penalty(
+        logprob=student_lp_at_sampled, ref_logprob=teacher_lp_at_sampled, kl_penalty="k1"
+    )
+    if loss_config.loss_max_clamp is not None:
+        k1_per_token = k1_per_token.clamp(
+            min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp
+        )
+
+    # 3. Build mask-strategy context (mirror k1_pg_fkl_topk).
+    teacher_topk_ids = no_padding_2_padding(data["teacher_ids"], data)
+    teacher_topk_logprobs = no_padding_2_padding(data["teacher_logprobs"], data)
+    responses = data["responses"]
+    if responses.is_nested:
+        responses = responses.to_padded_tensor(padding=0)
+    assert responses.shape == response_mask_bool.shape
+
+    is_argmax_padded = None
+    if "is_argmax" in model_output:
+        is_argmax_padded = no_padding_2_padding(model_output["is_argmax"], data).bool()
+    coverage_scores = None
+    if "coverage_scores" in model_output:
+        coverage_scores = no_padding_2_padding(model_output["coverage_scores"], data)
+    student_topk_probs = None
+    if "student_topk_probs" in model_output:
+        student_topk_probs = no_padding_2_padding(model_output["student_topk_probs"], data)
+    student_s2 = None
+    if "student_s2" in model_output:
+        student_s2 = no_padding_2_padding(model_output["student_s2"], data)
+    ctx = HybridMaskContext(
+        response_mask=response_mask_bool,
+        student_sampled_ids=responses,
+        student_log_prob_at_sampled=student_lp_at_sampled,
+        teacher_log_prob_at_sampled=teacher_lp_at_sampled,
+        teacher_topk_ids=teacher_topk_ids,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        k1_per_token=k1_per_token,
+        is_argmax=is_argmax_padded,
+        coverage_scores=coverage_scores,
+        student_topk_probs=student_topk_probs,
+        student_s2=student_s2,
+        mask_kwargs=dict(loss_config.hybrid_mask_kwargs) if loss_config.hybrid_mask_kwargs else {},
+    )
+    mask_fn = get_mask_fn(loss_config.hybrid_mask_strategy)
+    mask_result = mask_fn(ctx)
+    if isinstance(mask_result, tuple):
+        pg_mask_raw, sup_mask_raw = mask_result
+        assert pg_mask_raw.shape == sup_mask_raw.shape == response_mask_bool.shape
+        pg_mask = pg_mask_raw.bool() & response_mask_bool
+        sup_mask = sup_mask_raw.bool() & response_mask_bool
+        assert not (pg_mask & sup_mask).any(), (
+            "Mask strategy returned overlapping pg_mask and sup_mask"
+        )
+    else:
+        pg_mask_raw = mask_result
+        assert pg_mask_raw.shape == response_mask_bool.shape
+        pg_mask = pg_mask_raw.bool() & response_mask_bool
+        sup_mask = response_mask_bool & ~pg_mask
+
+    # Stash for the outer combine path. The combine path treats any combine_mode
+    # other than "rkl_all_fkl_masked" as "PG arm + supervised arm on sup_mask",
+    # which is exactly what we want here.
+    model_output["_hybrid_k1_per_token"] = k1_per_token
+    model_output["_hybrid_pg_mask"] = pg_mask
+    model_output["_hybrid_sup_mask"] = sup_mask
+    model_output["_hybrid_combine_mode"] = "k1_pg_jsd_topk"
+
+    total = response_mask_bool.sum().clamp(min=1)
+    distillation_metrics["distillation/pg_token_ratio"] = Metric(
+        AggregationType.MEAN, pg_mask.sum().float() / total.float()
+    )
+    dropped_mask = response_mask_bool & ~pg_mask & ~sup_mask
+    distillation_metrics["distillation/dropped_token_ratio"] = Metric(
+        AggregationType.MEAN, dropped_mask.sum().float() / total.float()
+    )
+    distillation_metrics["distillation/mean_k1"] = Metric(
+        AggregationType.MEAN, k1_per_token[response_mask_bool].mean()
+    )
+    distillation_metrics["distillation/std_k1"] = Metric(
+        AggregationType.MEAN, k1_per_token[response_mask_bool].std()
+    )
 
     return sup_losses, distillation_metrics
 
