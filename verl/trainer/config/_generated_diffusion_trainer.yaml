@@ -82,6 +82,10 @@ actor_rollout_ref:
     loss_agg_mode: token-mean
     loss_scale_factor: null
     entropy_coeff: 0
+    advantage_mask_low: null
+    advantage_mask_high: null
+    advantage_mask_percent: null
+    advantage_mask_skip_argmax: false
     calculate_entropy: false
     use_kl_loss: false
     use_prefix_grouper: false
@@ -400,6 +404,7 @@ data:
   validation_shuffle: false
   filter_overlong_prompts: false
   filter_overlong_prompts_workers: 1
+  enable_partial: false
   truncation: error
   image_key: images
   video_key: videos

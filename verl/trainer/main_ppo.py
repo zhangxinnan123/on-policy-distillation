@@ -417,6 +417,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         processor=processor,
         config=data_config,
         max_samples=max_samples,
+        is_train=is_train,
     )
 
     return dataset

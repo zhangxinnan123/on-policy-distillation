@@ -81,6 +81,12 @@ filter_overlong_prompts: False
 # Use multiprocessing to speed up. Default is 1.
 filter_overlong_prompts_workers: 1
 
+# When True, RLHFDataset asserts the parquet has 'partial' and 'agent_name'
+# columns and at least one row routes to single_turn_partial_continue_agent.
+# Per-row dispatch by 'agent_name' happens regardless; this flag is the
+# explicit contract that the data was prepared for partial-continuation.
+enable_partial: False
+
 # Truncate the input_ids or prompt if they exceed max_prompt_length.
 # Options: 'error', 'left', 'right', 'middle'. Default is 'error'.
 truncation: error
