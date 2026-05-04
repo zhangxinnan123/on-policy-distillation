@@ -21,10 +21,11 @@ from .agent_loop import (
     get_trajectory_info,
 )
 from .diffusion_agent_loop import DiffusionAgentLoopWorker
+from .partial_continue_agent_loop import SingleTurnPartialContinueAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, SingleTurnPartialContinueAgentLoop]
 
 __all__ = [
     "AgentLoopBase",

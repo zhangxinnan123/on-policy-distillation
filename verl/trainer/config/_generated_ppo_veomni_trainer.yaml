@@ -71,6 +71,10 @@ actor_rollout_ref:
     loss_agg_mode: token-mean
     loss_scale_factor: null
     entropy_coeff: 0
+    advantage_mask_low: null
+    advantage_mask_high: null
+    advantage_mask_percent: null
+    advantage_mask_skip_argmax: false
     calculate_entropy: false
     use_kl_loss: false
     use_prefix_grouper: false
@@ -401,6 +405,7 @@ data:
   validation_shuffle: false
   filter_overlong_prompts: false
   filter_overlong_prompts_workers: 1
+  enable_partial: false
   truncation: error
   image_key: images
   video_key: videos
@@ -697,6 +702,10 @@ distillation:
     clip_ratio: 0.2
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
+    pg_loss_coef: 1.0
+    supervised_loss_coef: 1.0
+    hybrid_mask_strategy: oot
+    hybrid_mask_kwargs: {}
   teacher_model:
     _target_: verl.workers.config.DistillationTeacherModelConfig
     enable_resource_pool: false

@@ -92,6 +92,7 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
+        is_train: bool = False,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -114,6 +115,8 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.enable_partial = config.get("enable_partial", False)
+        self.is_train = is_train
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -178,6 +181,26 @@ class RLHFDataset(Dataset):
             print(f"selected {self.max_samples} random samples out of {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        self._maybe_check_partial_schema(self.dataframe)
+
+    def _maybe_check_partial_schema(self, dataframe: datasets.Dataset) -> None:
+        if not self.enable_partial or not self.is_train:
+            return
+        partial_agent = "single_turn_partial_continue_agent"
+        cols = set(dataframe.column_names)
+        missing = [c for c in ("partial", "agent_name") if c not in cols]
+        if missing:
+            raise ValueError(
+                f"data.enable_partial=True but parquet is missing required columns {missing}. "
+                f"Files: {self.data_files}"
+            )
+        n_partial = sum(1 for name in dataframe["agent_name"] if name == partial_agent)
+        if n_partial == 0:
+            raise ValueError(
+                f"data.enable_partial=True but no rows have agent_name={partial_agent!r}. "
+                f"Wrong parquet? Files: {self.data_files}"
+            )
+        print(f"[enable_partial] {len(dataframe)} rows, {n_partial} routed to {partial_agent}")
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
@@ -187,6 +210,15 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+
+            def _partial_token_len(doc) -> int:
+                # Partial-continuation rows append a teacher-prefix to the rendered
+                # prompt at rollout time; account for those tokens here so the filter
+                # threshold reflects the actual prompt length the model will see.
+                partial = doc.get("partial", "") if isinstance(doc, dict) else ""
+                if not partial:
+                    return 0
+                return len(tokenizer.encode(partial, add_special_tokens=False))
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -228,7 +260,7 @@ class RLHFDataset(Dataset):
 
                         if images is None and videos is None:
                             # only text prompt
-                            return len(
+                            base_len = len(
                                 processor.tokenizer(
                                     text=raw_prompt,
                                     add_special_tokens=False,  # avoid adding special tokens
@@ -237,11 +269,12 @@ class RLHFDataset(Dataset):
                             )
                         else:
                             # multi-modal prompt
-                            return len(
+                            base_len = len(
                                 processor(text=[raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs)[
                                     "input_ids"
                                 ][0]
                             )
+                        return base_len + _partial_token_len(doc)
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
@@ -263,7 +296,7 @@ class RLHFDataset(Dataset):
                         tokenized_prompt = tokenizer.apply_chat_template(
                             doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
-                        return len(normalize_token_ids(tokenized_prompt))
+                        return len(normalize_token_ids(tokenized_prompt)) + _partial_token_len(doc)
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
