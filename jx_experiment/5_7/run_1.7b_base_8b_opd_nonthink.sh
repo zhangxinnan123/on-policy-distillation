@@ -41,11 +41,7 @@ SUPERVISED_LOSS_COEF=1.0
 DISTILLATION_LOSS_MAX_CLAMP=10.0
 DISTILLATION_LOG_PROB_MIN_CLAMP=-10.0
 
-# Partial rows append a teacher-prefix to the prompt; total context is held to
-# MAX_PROMPT + MAX_RESPONSE_LENGTH = 16382. Filter is on (re-enabled below) and
-# patched in rl_dataset.doc2len to count the partial; rows that don't fit are
-# dropped at load time.
-MAX_PROMPT=$(( 16382 - 4096 ))   # 12286
+MAX_PROMPT=2048
 MAX_RESPONSE_LENGTH=4096
 VAL_MAX_RESPONSE_LENGTH=8192
 MAX_NUM_TOKENS=$(( MAX_PROMPT + VAL_MAX_RESPONSE_LENGTH + 1 ))
@@ -68,7 +64,7 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_partial4"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}"
 
 ENFORCE_EAGER=True # true for faster debugging
 
@@ -96,7 +92,6 @@ DATA=(
     data.max_response_length=$MAX_RESPONSE_LENGTH
     data.train_batch_size=$TRAIN_PROMPT_BSZ
     data.filter_overlong_prompts=True
-    data.enable_partial=True
     data.truncation='error'
     data.shuffle=False
     +data.apply_chat_template_kwargs.enable_thinking=False
@@ -214,7 +209,7 @@ echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"
 echo "SUPERVISED_LOSS_COEF: $SUPERVISED_LOSS_COEF"
-echo "PARTIAL: enable_partial=True, MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
+echo "NON-PARTIAL: MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
 echo "================================================================================"
 
 python3 -m verl.trainer.main_ppo \
