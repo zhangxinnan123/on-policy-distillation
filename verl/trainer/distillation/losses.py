@@ -317,6 +317,78 @@ def _emit_topk_diagnostics(
         metrics["distillation/mean_k1"] = Metric(AggregationType.MEAN, k1_resp.mean())
         metrics["distillation/std_k1"] = Metric(AggregationType.MEAN, k1_resp.std())
 
+    # --- Per-token PG/teacher direction conflict ratio (top-k modes only) ---
+    # A position is "in conflict" if any teacher-supported top-p candidate would
+    # be moved by the PG step in the opposite direction the teacher wants. Same
+    # per-candidate check as opd_theory_guided, aggregated to position-level via
+    # any() — no summation across candidates (matches user spec).
+    conflict_inputs_present = (
+        "student_topk_probs" in model_output
+        and "student_s2" in model_output
+        and "log_probs" in model_output
+        and "teacher_ids" in data
+        and "teacher_logprobs" in data
+        and "responses" in data
+    )
+    if conflict_inputs_present:
+        s2 = no_padding_2_padding(model_output["student_s2"], data)
+        pi_c = no_padding_2_padding(model_output["student_topk_probs"], data)
+        student_lp = no_padding_2_padding(model_output["log_probs"], data)
+        teacher_topk_ids = no_padding_2_padding(data["teacher_ids"], data)
+        teacher_topk_logp = no_padding_2_padding(data["teacher_logprobs"], data)
+        responses = data["responses"]
+        if responses.is_nested:
+            responses = responses.to_padded_tensor(padding=0)
+
+        if k1_per_token is None and "teacher_next_token_logprobs" in data:
+            teacher_lp = no_padding_2_padding(data["teacher_next_token_logprobs"], data)
+            k1_local = student_lp - teacher_lp
+        else:
+            k1_local = k1_per_token
+
+        if (
+            k1_local is not None
+            and s2.shape == response_mask_bool.shape
+            and student_lp.shape == response_mask_bool.shape
+            and teacher_topk_ids.shape[:2] == response_mask_bool.shape
+            and pi_c.shape[:2] == response_mask_bool.shape
+            and responses.shape == response_mask_bool.shape
+        ):
+            top_p = float((loss_config.hybrid_mask_kwargs or {}).get("top_p", 0.95))
+            teacher_probs = teacher_topk_logp.exp()
+            shifted_cumsum = torch.cat(
+                [
+                    torch.zeros_like(teacher_probs[..., :1]),
+                    teacher_probs.cumsum(dim=-1)[..., :-1],
+                ],
+                dim=-1,
+            )
+            teacher_candidate = shifted_cumsum < top_p  # (B, T, K)
+
+            sampled_at_c = teacher_topk_ids == responses.unsqueeze(-1)  # (B, T, K)
+
+            # k1_local = student_lp - teacher_lp; opd_theory_guided uses the
+            # opposite sign (teacher_lp - student_lp), so negate.
+            k1_b = (-k1_local).unsqueeze(-1)  # (B, T, 1)
+            pi_a_b = student_lp.exp().unsqueeze(-1)  # (B, T, 1)
+            bracket = s2.unsqueeze(-1) - pi_a_b - pi_c  # (B, T, K)
+            pg_dir_value = torch.where(sampled_at_c, k1_b.expand_as(pi_c), k1_b * bracket)
+            pg_raises_c = pg_dir_value > 0
+            pg_lowers_c = pg_dir_value < 0
+
+            want_increase_c = teacher_probs > pi_c
+            want_decrease_c = teacher_probs < pi_c
+
+            direction_conflict = (
+                (want_increase_c & pg_lowers_c) | (want_decrease_c & pg_raises_c)
+            ) & teacher_candidate  # (B, T, K)
+            conflict_at_pos = direction_conflict.any(dim=-1)  # (B, T)
+
+            metrics["distillation/pg_conflict_ratio"] = Metric(
+                AggregationType.MEAN,
+                conflict_at_pos[response_mask_bool].float().mean(),
+            )
+
     return metrics
 
 
