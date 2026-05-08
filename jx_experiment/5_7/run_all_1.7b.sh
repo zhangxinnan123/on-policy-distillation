@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS=(
     "jx_experiment/5_7/run_1.7b_base_8b_opd_nonthink.sh"
     "jx_experiment/5_7/run_1.7b_SFT_8b_opd_nonthink.sh"
+    "jx_experiment/5_7/run_1.7b_base_8b_opd_nonthink_partial.sh"
 )
 
 declare -a RESULTS=()
