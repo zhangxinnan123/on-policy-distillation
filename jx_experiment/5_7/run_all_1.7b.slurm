@@ -34,6 +34,7 @@ HERE="/home/jasonjx/on-policy-distillation"
 SCRIPTS=(
     "jx_experiment/5_7/run_1.7b_base_8b_opd_nonthink.slurm"
     "jx_experiment/5_7/run_1.7b_SFT_8b_opd_nonthink.slurm"
+    "jx_experiment/5_7/run_1.7b_base_8b_opd_nonthink_partial.slurm"
 )
 
 declare -a RESULTS=()
