@@ -35,6 +35,8 @@ class TeacherModelManager:
         self,
         config: DictConfig,
         resource_pool: RayResourcePool = None,
+        student_eos_token_id: int = None,
+        teacher_eos_token_id: int = None,
     ):
         """
         Initialize the teacher model manager.
@@ -47,6 +49,8 @@ class TeacherModelManager:
         # Need dataclass conversion for max_logprobs handling in post_init
         self.config: DistillationConfig = omega_conf_to_dataclass(config)
         self.resource_pool = resource_pool
+        self.student_eos_token_id = student_eos_token_id
+        self.teacher_eos_token_id = teacher_eos_token_id
         self._initialize_llm_servers()
         self._initialize_async_server_manager()
         self._initialize_router()
@@ -112,6 +116,8 @@ class TeacherModelManager:
             load_balancer_handle=self.load_balancer_handle,
             distillation_config=self.config,
             pad_token_id=self.pad_token_id,
+            student_eos_token_id=self.student_eos_token_id,
+            teacher_eos_token_id=self.teacher_eos_token_id,
         )
 
     def _initialize_router(self):

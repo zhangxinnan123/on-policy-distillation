@@ -161,6 +161,12 @@ class DistillationTeacherModelConfig(BaseConfig):
         Passed to `tokenizer.apply_chat_template(enable_thinking=...)` when
         `reapply_chat_template` is True. Only affects the prompt-side template;
         the student's response is appended as-is.
+    substitute_eos_token (bool):
+        If True, replace the student's EOS token with the teacher's EOS token
+        (<|im_end|>) at the end of each response before querying the teacher.
+        Useful when the student (e.g. a base model) uses a different EOS token
+        than the teacher (e.g. an instruct model using <|im_end|>), and both
+        share the same tokenizer vocabulary.
     """
 
     _mutable_fields = BaseConfig._mutable_fields
@@ -172,6 +178,7 @@ class DistillationTeacherModelConfig(BaseConfig):
     inference: RolloutConfig = field(default_factory=RolloutConfig)
     reapply_chat_template: bool = False
     enable_thinking: bool = False
+    substitute_eos_token: bool = False
 
 
 @dataclass

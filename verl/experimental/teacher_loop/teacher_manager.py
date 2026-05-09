@@ -98,6 +98,8 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         load_balancer_handle: ray.actor.ActorHandle,
         distillation_config: DictConfig | DistillationConfig,
         pad_token_id: int,
+        student_eos_token_id: Optional[int] = None,
+        teacher_eos_token_id: Optional[int] = None,
     ):
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
         if isinstance(distillation_config, DistillationConfig):
@@ -106,7 +108,9 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(distillation_config)
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
         self.pad_token_id = pad_token_id
+        self.student_eos_token_id = student_eos_token_id
         self.reapply_chat_template = self.distillation_config.teacher_model.reapply_chat_template
+        self.substitute_eos_token = self.distillation_config.teacher_model.substitute_eos_token
         self.enable_thinking = self.distillation_config.teacher_model.enable_thinking
         if self.reapply_chat_template:
             teacher_model_path = self.distillation_config.teacher_model.model_path
@@ -115,8 +119,10 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                     "distillation.teacher_model.model_path is required when reapply_chat_template is True."
                 )
             self.teacher_tokenizer = hf_tokenizer(teacher_model_path)
+            self.teacher_eos_token_id = self.teacher_tokenizer.convert_tokens_to_ids("<|im_end|>")
         else:
             self.teacher_tokenizer = None
+            self.teacher_eos_token_id = teacher_eos_token_id if self.substitute_eos_token else None
 
     def _build_teacher_sequence_ids(
         self,
@@ -145,6 +151,12 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             if hasattr(student_response_ids, "tolist")
             else list(student_response_ids)
         )
+        if (
+            response_list
+            and self.student_eos_token_id is not None
+            and response_list[-1] == self.student_eos_token_id
+        ):
+            response_list[-1] = self.teacher_eos_token_id
         teacher_sequence_ids = list(teacher_prompt_ids) + response_list
         return teacher_sequence_ids, len(teacher_prompt_ids)
 
@@ -203,7 +215,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             item = data[i : i + 1]
             sequence_ids, prompt_length, response_length = _unpad_teacher_inputs(item)
             multi_modal_data = None if multi_modal_data_batch is None else multi_modal_data_batch[i]
-
+            # breakpoint()  # for debugging; remove later
             if self.reapply_chat_template:
                 student_response_ids = sequence_ids[prompt_length:]
                 teacher_sequence_ids, response_start = self._build_teacher_sequence_ids(
@@ -224,6 +236,14 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                     )
                 )
             else:
+                if (
+                    self.student_eos_token_id is not None
+                    and self.teacher_eos_token_id is not None
+                    and len(sequence_ids) > 0
+                    and sequence_ids[-1] == self.student_eos_token_id
+                ):
+                    sequence_ids = list(sequence_ids)
+                    sequence_ids[-1] = self.teacher_eos_token_id
                 lengths.append((prompt_length, response_length))
                 tasks.append(
                     asyncio.create_task(

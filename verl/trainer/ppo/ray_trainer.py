@@ -865,6 +865,8 @@ class RayPPOTrainer:
             self.teacher_model_manager = TeacherModelManager(
                 config=self.config.distillation,
                 resource_pool=teacher_resource_pool,
+                student_eos_token_id=self.tokenizer.eos_token_id,
+                teacher_eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
