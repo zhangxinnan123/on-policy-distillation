@@ -210,6 +210,9 @@ The distillation config (`verl/trainer/config/distillation/distillation.yaml`) c
 - `use_task_rewards`: combine distillation loss with RL reward
 - `use_policy_gradient`: treat negative distillation loss as advantage signal instead of direct supervised loss
 - `teacher_model.*`: teacher inference server configuration
+  - `reapply_chat_template` (default `False`): re-apply the teacher's chat template to the raw prompt before concatenating the student's response ids. Use when student and teacher have different prompt formats (e.g. student is a base model, teacher is an instruct model). Requires `teacher_model.model_path` to be set. Student and teacher must share the same tokenizer vocabulary.
+  - `enable_thinking` (default `False`): passed to `apply_chat_template(enable_thinking=...)` when `reapply_chat_template=True`.
+  - `substitute_eos_token` (default `False`): replace the student's EOS token with the teacher's `<|im_end|>` token at the end of each response before querying the teacher. Use when the student (e.g. a base model using `<|endoftext|>`) and teacher (e.g. an instruct model using `<|im_end|>`) share the same tokenizer vocabulary but have different EOS tokens. Enable in bash script with `distillation.teacher_model.substitute_eos_token=True`.
 
 Example script: `examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh`
 
