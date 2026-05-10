@@ -21,7 +21,7 @@ In either form, pg_mask and sup_mask must be disjoint subsets of response_mask.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -35,13 +35,13 @@ class HybridMaskContext:
     are still populated; strategies just ignore what they don't use.
     """
 
-    response_mask: torch.Tensor               # (B, T) bool
-    student_sampled_ids: torch.Tensor         # (B, T) int
-    student_log_prob_at_sampled: torch.Tensor # (B, T) float
-    teacher_log_prob_at_sampled: torch.Tensor # (B, T) float — from teacher_next_token_logprobs
-    teacher_topk_ids: torch.Tensor            # (B, T, K) int, sorted descending by logprob
-    teacher_topk_logprobs: torch.Tensor       # (B, T, K) float
-    k1_per_token: torch.Tensor                # (B, T) float = student_lp - teacher_lp at sampled
+    response_mask: torch.Tensor  # (B, T) bool
+    student_sampled_ids: torch.Tensor  # (B, T) int
+    student_log_prob_at_sampled: torch.Tensor  # (B, T) float
+    teacher_log_prob_at_sampled: torch.Tensor  # (B, T) float — from teacher_next_token_logprobs
+    teacher_topk_ids: torch.Tensor  # (B, T, K) int, sorted descending by logprob
+    teacher_topk_logprobs: torch.Tensor  # (B, T, K) float
+    k1_per_token: torch.Tensor  # (B, T) float = student_lp - teacher_lp at sampled
     is_argmax: Optional[torch.Tensor] = None  # (B, T) bool, may be missing w/ fused kernels
     # (B, T) precomputed student-mass coverage on teacher's top-p prefix,
     # surfaced by the FSDP compute_forward_kl_topk logit processor. top_p is
@@ -75,9 +75,7 @@ def register_mask(name: str) -> Callable[[MaskFn], MaskFn]:
 
 def get_mask_fn(name: str) -> MaskFn:
     if name not in MASK_REGISTRY:
-        raise ValueError(
-            f"Unknown hybrid mask strategy '{name}'. Available: {sorted(MASK_REGISTRY.keys())}"
-        )
+        raise ValueError(f"Unknown hybrid mask strategy '{name}'. Available: {sorted(MASK_REGISTRY.keys())}")
     return MASK_REGISTRY[name]
 
 
@@ -298,19 +296,13 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
 
     # Direction conflict:
     # teacher wants c up but PG lowers it, or teacher wants c down but PG raises it.
-    direction_conflict = (
-        (want_increase_c & pg_lowers_c)
-        | (want_decrease_c & pg_raises_c)
-    )  # (B, T, K)
+    direction_conflict = (want_increase_c & pg_lowers_c) | (want_decrease_c & pg_raises_c)  # (B, T, K)
 
     # Support failure:
     # teacher wants c higher, but student probability is near zero.
     # Even if PG direction is correct, Delta pi(c) is proportional to pi_c,
     # so PG/RKL cannot reliably recover this missing mode.
-    low_student_coverage = (
-        (pi_c < student_low_threshold)
-        & want_increase_c
-    )  # (B, T, K)
+    low_student_coverage = (pi_c < student_low_threshold) & want_increase_c  # (B, T, K)
 
     need_fkl_per_c = torch.zeros_like(teacher_candidate, dtype=torch.bool)
 
@@ -326,6 +318,16 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     # Position-level routing:
     # if any teacher-supported token needs FKL, route this position to FKL.
     pg_mask = ~need_fkl_per_c.any(dim=-1)  # (B, T)
+
+    # Compute separate metrics for conflict and low_coverage
+    # Only count within teacher candidates
+    if use_direction_rule:
+        conflict_per_position = (direction_conflict & teacher_candidate).any(dim=-1)  # (B, T)
+        ctx.extras["opd_conflict_mask"] = conflict_per_position
+
+    if use_low_coverage_rule:
+        low_coverage_per_position = (low_student_coverage & teacher_candidate).any(dim=-1)  # (B, T)
+        ctx.extras["opd_low_coverage_mask"] = low_coverage_per_position
 
     return pg_mask
 
@@ -501,3 +503,4 @@ def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
     pg_mask = ~drop_pos
     sup_mask = torch.zeros_like(pg_mask)
     return pg_mask, sup_mask
+

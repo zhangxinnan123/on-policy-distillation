@@ -199,16 +199,14 @@ def _build_hybrid_masks(
         )
         pg_mask = pg_mask_raw.bool() & response_mask_bool
         sup_mask = sup_mask_raw.bool() & response_mask_bool
-        assert not (pg_mask & sup_mask).any(), (
-            "Mask strategy returned overlapping pg_mask and sup_mask"
-        )
+        assert not (pg_mask & sup_mask).any(), "Mask strategy returned overlapping pg_mask and sup_mask"
     else:
         assert mask_result.shape == response_mask_bool.shape, (
             f"Mask strategy returned {mask_result.shape}, expected {response_mask_bool.shape}"
         )
         pg_mask = mask_result.bool() & response_mask_bool
         sup_mask = response_mask_bool & ~pg_mask
-    return pg_mask, sup_mask
+    return pg_mask, sup_mask, ctx.extras
 
 
 def _emit_topk_diagnostics(
@@ -220,6 +218,7 @@ def _emit_topk_diagnostics(
     pg_mask: Optional[torch.Tensor] = None,
     sup_mask: Optional[torch.Tensor] = None,
     k1_per_token: Optional[torch.Tensor] = None,
+    mask_extras: Optional[dict] = None,
 ) -> dict[str, Any]:
     """Unified diagnostic metric dict for any top-k distillation loss.
 
@@ -259,9 +258,7 @@ def _emit_topk_diagnostics(
             key = f"{prefix}{j}"
             if key in model_output:
                 vals = no_padding_2_padding(model_output[key], data)
-                metrics[f"distillation/{key}"] = Metric(
-                    AggregationType.MEAN, vals[response_mask_bool].mean()
-                )
+                metrics[f"distillation/{key}"] = Metric(AggregationType.MEAN, vals[response_mask_bool].mean())
         if j >= topk:
             break
         j = min(j * 2, topk)
@@ -277,17 +274,13 @@ def _emit_topk_diagnostics(
     # --- Top-p coverage (student mass on teacher's top-p prefix) ---
     if "coverage_scores" in model_output:
         cov = no_padding_2_padding(model_output["coverage_scores"], data)[response_mask_bool]
-        coverage_threshold = float(
-            (loss_config.hybrid_mask_kwargs or {}).get("coverage_threshold", 0.5)
-        )
+        coverage_threshold = float((loss_config.hybrid_mask_kwargs or {}).get("coverage_threshold", 0.5))
         metrics["distillation/top_p_coverage_mean"] = Metric(AggregationType.MEAN, cov.mean())
         metrics["distillation/top_p_coverage_std"] = Metric(AggregationType.MEAN, cov.std())
         metrics["distillation/top_p_high_coverage_ratio"] = Metric(
             AggregationType.MEAN, (cov >= coverage_threshold).float().mean()
         )
-        metrics["distillation/top_p_zero_coverage_ratio"] = Metric(
-            AggregationType.MEAN, (cov == 0).float().mean()
-        )
+        metrics["distillation/top_p_zero_coverage_ratio"] = Metric(AggregationType.MEAN, (cov == 0).float().mean())
         metrics["distillation/top_p_coverage_min"] = Metric(AggregationType.MIN, cov.min())
         metrics["distillation/top_p_coverage_max"] = Metric(AggregationType.MAX, cov.max())
 
@@ -305,9 +298,7 @@ def _emit_topk_diagnostics(
 
     if pg_mask is not None and k1_per_token is not None:
         total = response_mask_bool.sum().clamp(min=1).float()
-        metrics["distillation/pg_token_ratio"] = Metric(
-            AggregationType.MEAN, pg_mask.sum().float() / total
-        )
+        metrics["distillation/pg_token_ratio"] = Metric(AggregationType.MEAN, pg_mask.sum().float() / total)
         if sup_mask is not None:
             dropped_mask = response_mask_bool & ~pg_mask & ~sup_mask
             metrics["distillation/dropped_token_ratio"] = Metric(
@@ -316,6 +307,19 @@ def _emit_topk_diagnostics(
         k1_resp = k1_per_token[response_mask_bool]
         metrics["distillation/mean_k1"] = Metric(AggregationType.MEAN, k1_resp.mean())
         metrics["distillation/std_k1"] = Metric(AggregationType.MEAN, k1_resp.std())
+
+        # Add separate metrics for opd_theory_guided mask components if present
+        if mask_extras is not None:
+            if "opd_conflict_mask" in mask_extras:
+                conflict_mask = mask_extras["opd_conflict_mask"] & response_mask_bool
+                metrics["distillation/opd_conflict_ratio"] = Metric(
+                    AggregationType.MEAN, conflict_mask.sum().float() / total
+                )
+            if "opd_low_coverage_mask" in mask_extras:
+                low_coverage_mask = mask_extras["opd_low_coverage_mask"] & response_mask_bool
+                metrics["distillation/opd_low_coverage_ratio"] = Metric(
+                    AggregationType.MEAN, low_coverage_mask.sum().float() / total
+                )
 
     # --- Per-token PG/teacher direction conflict ratio (top-k modes only) ---
     # A position is "in conflict" if any teacher-supported top-p candidate would
@@ -404,7 +408,7 @@ def _compute_pg_diag_for_non_hybrid(
     hybrid losses emit. Returns ``(pg_mask, sup_mask, k1_per_token)`` or
     ``None`` if the strategy can't run on what the kernel surfaced.
     """
-    from verl.trainer.distillation.hybrid_masks import HybridMaskContext, MASK_REGISTRY, get_mask_fn
+    from verl.trainer.distillation.hybrid_masks import MASK_REGISTRY, HybridMaskContext, get_mask_fn
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     strategy = loss_config.hybrid_mask_strategy
@@ -419,9 +423,7 @@ def _compute_pg_diag_for_non_hybrid(
         return None
     k1_per_token = kl_penalty(logprob=student_lp, ref_logprob=teacher_lp, kl_penalty="k1")
     if loss_config.loss_max_clamp is not None:
-        k1_per_token = k1_per_token.clamp(
-            min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp
-        )
+        k1_per_token = k1_per_token.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
     teacher_topk_ids = no_padding_2_padding(data["teacher_ids"], data)
     teacher_topk_logprobs = no_padding_2_padding(data["teacher_logprobs"], data)
@@ -507,17 +509,11 @@ def compute_topk_loss(
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             if loss_mode == "forward_kl_topk_approx":
-                raise NotImplementedError(
-                    "forward_kl_topk_approx is only implemented for the fsdp backend."
-                )
+                raise NotImplementedError("forward_kl_topk_approx is only implemented for the fsdp backend.")
             if loss_mode == "jsd_topk":
-                raise NotImplementedError(
-                    "jsd_topk is only implemented for the fsdp backend."
-                )
+                raise NotImplementedError("jsd_topk is only implemented for the fsdp backend.")
             if loss_mode == "k1_pg_jsd_topk":
-                raise NotImplementedError(
-                    "k1_pg_jsd_topk is only implemented for the fsdp backend."
-                )
+                raise NotImplementedError("k1_pg_jsd_topk is only implemented for the fsdp backend.")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -675,9 +671,7 @@ def distillation_loss(
                 loss_agg_mode=loss_agg_mode,
                 **loss_config.global_batch_info,
             )
-            distillation_loss = (
-                loss_config.pg_loss_coef * rkl_loss + loss_config.supervised_loss_coef * fkl_loss
-            )
+            distillation_loss = loss_config.pg_loss_coef * rkl_loss + loss_config.supervised_loss_coef * fkl_loss
             distillation_metrics["distillation/rkl_all_loss"] = Metric(
                 value=rkl_loss.detach(), aggregation=AggregationType.MEAN
             )
@@ -715,9 +709,7 @@ def distillation_loss(
             distillation_metrics.update(pg_metrics)
             distillation_metrics.update(pg_extra_metrics)
 
-            distillation_loss = (
-                loss_config.pg_loss_coef * pg_loss + loss_config.supervised_loss_coef * sup_loss
-            )
+            distillation_loss = loss_config.pg_loss_coef * pg_loss + loss_config.supervised_loss_coef * sup_loss
             distillation_metrics["distillation/pg_loss"] = Metric(
                 value=pg_loss.detach(), aggregation=AggregationType.MEAN
             )
@@ -815,11 +807,10 @@ def _compute_pg_distillation_loss(
             max_size = max(all_sizes)
             padded = torch.nn.functional.pad(valid_advs, (0, max_size - valid_advs.numel()))
 
-            gathered = [torch.zeros(max_size, dtype=padded.dtype, device=padded.device)
-                        for _ in range(world_size)]
+            gathered = [torch.zeros(max_size, dtype=padded.dtype, device=padded.device) for _ in range(world_size)]
             torch.distributed.all_gather(gathered, padded, group=dp_group)
 
-            all_advs = torch.cat([t[:s] for t, s in zip(gathered, all_sizes)])
+            all_advs = torch.cat([t[:s] for t, s in zip(gathered, all_sizes, strict=False)])
         else:
             all_advs = valid_advs
 
@@ -887,22 +878,14 @@ def _compute_pg_distillation_loss(
         total_tokens = response_mask.sum().detach().item()
         kept_tokens = pg_response_mask.sum().detach().item()
         ratio = kept_tokens / total_tokens if total_tokens > 0 else 1.0
-        extra_metrics["distillation/adv_mask_keep_ratio"] = Metric(
-            value=ratio, aggregation=AggregationType.MEAN
-        )
+        extra_metrics["distillation/adv_mask_keep_ratio"] = Metric(value=ratio, aggregation=AggregationType.MEAN)
         extra_metrics["distillation/adv_mask_total_tokens"] = Metric(
             value=total_tokens, aggregation=AggregationType.SUM
         )
-        extra_metrics["distillation/adv_mask_kept_tokens"] = Metric(
-            value=kept_tokens, aggregation=AggregationType.SUM
-        )
+        extra_metrics["distillation/adv_mask_kept_tokens"] = Metric(value=kept_tokens, aggregation=AggregationType.SUM)
         if adv_mask_low is not None and adv_mask_high is not None:
-            extra_metrics["distillation/adv_mask_low"] = Metric(
-                value=adv_mask_low, aggregation=AggregationType.MEAN
-            )
-            extra_metrics["distillation/adv_mask_high"] = Metric(
-                value=adv_mask_high, aggregation=AggregationType.MEAN
-            )
+            extra_metrics["distillation/adv_mask_low"] = Metric(value=adv_mask_low, aggregation=AggregationType.MEAN)
+            extra_metrics["distillation/adv_mask_high"] = Metric(value=adv_mask_high, aggregation=AggregationType.MEAN)
     if argmax_skip_requested and argmax_available:
         argmax_actually_masked = (argmax_to_mask & pre_argmax_mask.bool()).sum().detach().item()
         survived_adv_mask = pre_argmax_mask.sum().detach().item()
@@ -955,9 +938,7 @@ def compute_forward_kl_topk(
     return distillation_losses, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["jsd_topk"], use_topk=True)
-)  # type: ignore[arg-type]
+@register_distillation_loss(DistillationLossSettings(names=["jsd_topk"], use_topk=True))  # type: ignore[arg-type]
 def compute_jsd_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -986,9 +967,7 @@ def compute_jsd_topk(
     return distillation_losses, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["k1_pg_fkl_topk"], use_topk=True, use_hybrid=True)
-)  # type: ignore[arg-type]
+@register_distillation_loss(DistillationLossSettings(names=["k1_pg_fkl_topk"], use_topk=True, use_hybrid=True))  # type: ignore[arg-type]
 def compute_k1_pg_fkl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -1034,15 +1013,11 @@ def compute_k1_pg_fkl_topk(
     student_lp_at_sampled = no_padding_2_padding(model_output["log_probs"], data)
     teacher_lp_at_sampled = no_padding_2_padding(data["teacher_next_token_logprobs"], data)
     assert student_lp_at_sampled.shape == teacher_lp_at_sampled.shape == response_mask_bool.shape
-    k1_per_token = kl_penalty(
-        logprob=student_lp_at_sampled, ref_logprob=teacher_lp_at_sampled, kl_penalty="k1"
-    )
+    k1_per_token = kl_penalty(logprob=student_lp_at_sampled, ref_logprob=teacher_lp_at_sampled, kl_penalty="k1")
     if loss_config.loss_max_clamp is not None:
-        k1_per_token = k1_per_token.clamp(
-            min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp
-        )
+        k1_per_token = k1_per_token.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
-    pg_mask, sup_mask = _build_hybrid_masks(
+    pg_mask, sup_mask, mask_extras = _build_hybrid_masks(
         model_output=model_output,
         data=data,
         loss_config=loss_config,
@@ -1067,14 +1042,13 @@ def compute_k1_pg_fkl_topk(
         pg_mask=pg_mask,
         sup_mask=sup_mask,
         k1_per_token=k1_per_token,
+        mask_extras=mask_extras,
     )
 
     return sup_losses, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["k1_pg_jsd_topk"], use_topk=True, use_hybrid=True)
-)  # type: ignore[arg-type]
+@register_distillation_loss(DistillationLossSettings(names=["k1_pg_jsd_topk"], use_topk=True, use_hybrid=True))  # type: ignore[arg-type]
 def compute_k1_pg_jsd_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -1098,15 +1072,11 @@ def compute_k1_pg_jsd_topk(
     student_lp_at_sampled = no_padding_2_padding(model_output["log_probs"], data)
     teacher_lp_at_sampled = no_padding_2_padding(data["teacher_next_token_logprobs"], data)
     assert student_lp_at_sampled.shape == teacher_lp_at_sampled.shape == response_mask_bool.shape
-    k1_per_token = kl_penalty(
-        logprob=student_lp_at_sampled, ref_logprob=teacher_lp_at_sampled, kl_penalty="k1"
-    )
+    k1_per_token = kl_penalty(logprob=student_lp_at_sampled, ref_logprob=teacher_lp_at_sampled, kl_penalty="k1")
     if loss_config.loss_max_clamp is not None:
-        k1_per_token = k1_per_token.clamp(
-            min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp
-        )
+        k1_per_token = k1_per_token.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
-    pg_mask, sup_mask = _build_hybrid_masks(
+    pg_mask, sup_mask, mask_extras = _build_hybrid_masks(
         model_output=model_output,
         data=data,
         loss_config=loss_config,
@@ -1132,13 +1102,12 @@ def compute_k1_pg_jsd_topk(
         pg_mask=pg_mask,
         sup_mask=sup_mask,
         k1_per_token=k1_per_token,
+        mask_extras=mask_extras,
     )
     return sup_losses, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["rkl_all_fkl_masked"], use_topk=True, use_hybrid=True)
-)  # type: ignore[arg-type]
+@register_distillation_loss(DistillationLossSettings(names=["rkl_all_fkl_masked"], use_topk=True, use_hybrid=True))  # type: ignore[arg-type]
 def compute_rkl_all_fkl_masked(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -1178,9 +1147,7 @@ def compute_k1_topk_overlap(
     response_mask_bool = data["response_mask"].bool()
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
-    distillation_losses = kl_penalty(
-        logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty="k1"
-    )
+    distillation_losses = kl_penalty(logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty="k1")
 
     metrics = _emit_topk_diagnostics(
         model_output=model_output,
@@ -1191,12 +1158,8 @@ def compute_k1_topk_overlap(
     # Loss-value distribution stats. mean_loss/std_loss/abs_loss are kept under
     # their historical names for dashboards; mean_k1/std_k1 (added by the helper
     # via the non-hybrid PG diag path) carry the same values when both are present.
-    metrics["distillation/mean_loss"] = Metric(
-        AggregationType.MEAN, distillation_losses[response_mask_bool].mean()
-    )
-    metrics["distillation/std_loss"] = Metric(
-        AggregationType.MEAN, distillation_losses[response_mask_bool].std()
-    )
+    metrics["distillation/mean_loss"] = Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].mean())
+    metrics["distillation/std_loss"] = Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].std())
     metrics["distillation/abs_loss"] = Metric(
         AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()
     )
