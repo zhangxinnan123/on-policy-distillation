@@ -47,9 +47,11 @@ USE_FUSED_KERNELS=False
 # full routing rules (low-coverage, negative-k1, positive-k1).
 HYBRID_MASK_STRATEGY="opd_theory_guided"
 HYBRID_MASK_STUDENT_LOW_THRESHOLD=5e-2   # Rule 1: pi_c < this  → FKL
+HYBRID_MASK_STUDENT_HIGH_THRESHOLD=$(python3 -c "print(1 - $HYBRID_MASK_STUDENT_LOW_THRESHOLD)")  # Rule 1b: pi_c > this & teacher wants ↓ → FKL
 HYBRID_MASK_TEACHER_TOP_P=0.95            # nucleus mass for teacher candidates c
 HYBRID_MASK_ADV_EPS=0.0                  # dead-zone around k1=0
 HYBRID_MASK_USE_LOW_COVERAGE_RULE=True
+HYBRID_MASK_USE_HIGH_COVERAGE_RULE=True
 HYBRID_MASK_USE_NEGATIVE_RULE=True
 HYBRID_MASK_USE_POSITIVE_RULE=True
 
@@ -86,7 +88,7 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_partial4_nocurric_subeos"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_partial4_nocurric_subeos_hicov"
 
 ENFORCE_EAGER=True # true for faster debugging
 
@@ -154,9 +156,11 @@ DISTILLATION=(
     distillation.distillation_loss.pg_loss_coef=$PG_LOSS_COEF
     distillation.distillation_loss.supervised_loss_coef=$SUPERVISED_LOSS_COEF
     +distillation.distillation_loss.hybrid_mask_kwargs.student_low_threshold=$HYBRID_MASK_STUDENT_LOW_THRESHOLD
+    +distillation.distillation_loss.hybrid_mask_kwargs.student_high_threshold=$HYBRID_MASK_STUDENT_HIGH_THRESHOLD
     +distillation.distillation_loss.hybrid_mask_kwargs.teacher_top_p=$HYBRID_MASK_TEACHER_TOP_P
     +distillation.distillation_loss.hybrid_mask_kwargs.adv_eps=$HYBRID_MASK_ADV_EPS
     +distillation.distillation_loss.hybrid_mask_kwargs.use_low_coverage_rule=$HYBRID_MASK_USE_LOW_COVERAGE_RULE
+    +distillation.distillation_loss.hybrid_mask_kwargs.use_high_coverage_rule=$HYBRID_MASK_USE_HIGH_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
     distillation.teacher_model.substitute_eos_token=True
@@ -239,9 +243,11 @@ echo "================== Theory-Guided OPD Mask Configuration ==================
 echo "DISTILLATION_LOSS_MODE: $DISTILLATION_LOSS_MODE"
 echo "HYBRID_MASK_STRATEGY: $HYBRID_MASK_STRATEGY"
 echo "HYBRID_MASK_STUDENT_LOW_THRESHOLD: $HYBRID_MASK_STUDENT_LOW_THRESHOLD"
+echo "HYBRID_MASK_STUDENT_HIGH_THRESHOLD: $HYBRID_MASK_STUDENT_HIGH_THRESHOLD"
 echo "HYBRID_MASK_TEACHER_TOP_P: $HYBRID_MASK_TEACHER_TOP_P"
 echo "HYBRID_MASK_ADV_EPS: $HYBRID_MASK_ADV_EPS"
 echo "HYBRID_MASK_USE_LOW_COVERAGE_RULE: $HYBRID_MASK_USE_LOW_COVERAGE_RULE"
+echo "HYBRID_MASK_USE_HIGH_COVERAGE_RULE: $HYBRID_MASK_USE_HIGH_COVERAGE_RULE"
 echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=opd_1.7bBase_8b_nonthink_subeos_0510
+#SBATCH --job-name=opd_1.7bBase_8b_nonthink_0510
 #SBATCH --time=96:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
@@ -39,7 +39,7 @@ USE_POLICY_GRADIENT=True
 #   total = pg_loss_coef * RKL(all)  +  supervised_loss_coef * FKL(sup_mask)
 # This mode also routes through compute_forward_kl_topk, so student_topk_probs /
 # student_s2 (required by opd_theory_guided) are populated.
-DISTILLATION_LOSS_MODE="k1_topk_overlap"
+DISTILLATION_LOSS_MODE="k1_pg_fkl_topk"
 USE_FUSED_KERNELS=False
 
 # Theory-guided OPD masking strategy.
@@ -84,7 +84,7 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_subeos_hicov"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_hicov"
 
 ENFORCE_EAGER=True # true for faster debugging
 
@@ -157,7 +157,6 @@ DISTILLATION=(
     +distillation.distillation_loss.hybrid_mask_kwargs.use_high_coverage_rule=$HYBRID_MASK_USE_HIGH_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
-    distillation.teacher_model.substitute_eos_token=True
 )
 
 STUDENT=(
@@ -219,7 +218,7 @@ TRAINER=(
 ############################ Launch ############################
 
 echo "=========================================="
-echo "On-Policy Distillation Job (5_10 Qwen3-1.7B-Base k1_topk_overlap NonThink Subeos)"
+echo "On-Policy Distillation Job (5_10 Qwen3-1.7B-Base k1_topk_overlap NonThink)"
 echo "Job started: $(date)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_ID: $SLURM_JOB_ID"
@@ -245,7 +244,7 @@ echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"
 echo "SUPERVISED_LOSS_COEF: $SUPERVISED_LOSS_COEF"
-echo "NON-PARTIAL (subeos): MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
+echo "NON-PARTIAL: MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
 echo "================================================================================"
 
 python3 -m verl.trainer.main_ppo \

@@ -1,27 +1,9 @@
-#!/bin/bash
-#SBATCH --job-name=opd_1.7bBase_8b_nonthink_subeos_0510
-#SBATCH --time=96:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=0
-#SBATCH --output='/home/jasonjx/on-policy-distillation/logs/slurm_outputs/%x_%j.out'
-#SBATCH --account=mrs_2
-#SBATCH --qos=h200_mrs_2_high
-#SBATCH --gpus-per-node=4
-#SBATCH --gpu-bind=verbose,closest
-
+#!/usr/bin/env bash
 set -xeuo pipefail
 
 ############################ Quick Config ############################
 
-# --- inlined config.sh ---
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate opd
-
-WANDB_API_KEY="c4b67c713ad88ef65b62908bcaa8b5c5cb72d1a9"
-export WANDB_ENTITY="${WANDB_ENTITY:-rl_agent}"
-PROJECT_NAME="verl_opd_dapo"
+source "$(dirname "$0")/../config.sh"
 
 ROLLOUT_NAME="vllm" # sglang or vllm
 
@@ -39,7 +21,7 @@ USE_POLICY_GRADIENT=True
 #   total = pg_loss_coef * RKL(all)  +  supervised_loss_coef * FKL(sup_mask)
 # This mode also routes through compute_forward_kl_topk, so student_topk_probs /
 # student_s2 (required by opd_theory_guided) are populated.
-DISTILLATION_LOSS_MODE="k1_topk_overlap"
+DISTILLATION_LOSS_MODE="k1_pg_fkl_topk"
 USE_FUSED_KERNELS=False
 
 # Theory-guided OPD masking strategy.
@@ -84,12 +66,12 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_subeos_hicov"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_hicov"
 
 ENFORCE_EAGER=True # true for faster debugging
 
 ############################ Paths ############################
-DATA_PATH="/datasets/jasonjx/data"
+DATA_PATH="${HOME}/data/dapo_17k_aime2426-suffix"
 
 DAPO_TRAIN_PATH=$DATA_PATH/train.parquet
 DAPO_TEST_PATH=$DATA_PATH/test.parquet
@@ -157,7 +139,6 @@ DISTILLATION=(
     +distillation.distillation_loss.hybrid_mask_kwargs.use_high_coverage_rule=$HYBRID_MASK_USE_HIGH_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
-    distillation.teacher_model.substitute_eos_token=True
 )
 
 STUDENT=(
@@ -218,17 +199,6 @@ TRAINER=(
 
 ############################ Launch ############################
 
-echo "=========================================="
-echo "On-Policy Distillation Job (5_10 Qwen3-1.7B-Base k1_topk_overlap NonThink Subeos)"
-echo "Job started: $(date)"
-echo "Host: $(hostname)"
-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
-echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
-echo "Total GPUs: 4 (1 node x 4 GPUs)"
-echo "=========================================="
-
-cd /home/jasonjx/on-policy-distillation
-
 export VLLM_USE_V1=1
 export WANDB_API_KEY=$WANDB_API_KEY
 
@@ -245,7 +215,7 @@ echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"
 echo "SUPERVISED_LOSS_COEF: $SUPERVISED_LOSS_COEF"
-echo "NON-PARTIAL (subeos): MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
+echo "NON-PARTIAL: MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
 echo "================================================================================"
 
 python3 -m verl.trainer.main_ppo \
