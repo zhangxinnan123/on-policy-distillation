@@ -5,7 +5,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 SCRIPTS=(
     "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_partial.sh"
+    "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_partial_nocurriculum.sh"
     "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink.sh"
+    "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_subeos.sh"
     "jx_experiment/5_10/run_1.7b_SFT_8b_opd_nonthink.sh"
 )
 

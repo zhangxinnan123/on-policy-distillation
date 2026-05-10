@@ -1,14 +1,32 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#SBATCH --job-name=opd_1.7bBase_8b_nonthink_0510
+#SBATCH --time=96:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=0
+#SBATCH --output='/home/jasonjx/on-policy-distillation/logs/slurm_outputs/%x_%j.out'
+#SBATCH --account=mrs_2
+#SBATCH --qos=h200_mrs_2_high
+#SBATCH --gpus-per-node=4
+#SBATCH --gpu-bind=verbose,closest
+
 set -xeuo pipefail
 
 ############################ Quick Config ############################
 
-source "$(dirname "$0")/../config.sh"
+# --- inlined config.sh ---
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate opd
+
+WANDB_API_KEY="c4b67c713ad88ef65b62908bcaa8b5c5cb72d1a9"
+export WANDB_ENTITY="${WANDB_ENTITY:-rl_agent}"
+PROJECT_NAME="verl_opd_dapo"
 
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=lllyx/Qwen3-1.7B-SFT
+STUDENT_MODEL=Qwen/Qwen3-1.7B-Base
 TEACHER_MODEL=Qwen/Qwen3-8B
 
 # Hybrid per-token partition of k1 PG and supervised forward_kl_topk.
@@ -69,7 +87,7 @@ EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLA
 ENFORCE_EAGER=True # true for faster debugging
 
 ############################ Paths ############################
-DATA_PATH="${HOME}/data/dapo_17k_aime2426-suffix"
+DATA_PATH="/datasets/jasonjx/data"
 
 DAPO_TRAIN_PATH=$DATA_PATH/train.parquet
 DAPO_TEST_PATH=$DATA_PATH/test.parquet
@@ -194,6 +212,17 @@ TRAINER=(
 )
 
 ############################ Launch ############################
+
+echo "=========================================="
+echo "On-Policy Distillation Job (5_10 Qwen3-1.7B-Base k1_topk_overlap NonThink)"
+echo "Job started: $(date)"
+echo "Host: $(hostname)"
+echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "Total GPUs: 4 (1 node x 4 GPUs)"
+echo "=========================================="
+
+cd /home/jasonjx/on-policy-distillation
 
 export VLLM_USE_V1=1
 export WANDB_API_KEY=$WANDB_API_KEY

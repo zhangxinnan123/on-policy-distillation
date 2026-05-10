@@ -8,7 +8,7 @@ source "$(dirname "$0")/../config.sh"
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=lllyx/Qwen3-1.7B-SFT
+STUDENT_MODEL=Qwen/Qwen3-1.7B-Base
 TEACHER_MODEL=Qwen/Qwen3-8B
 
 # Hybrid per-token partition of k1 PG and supervised forward_kl_topk.
@@ -64,7 +64,7 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_subeos"
 
 ENFORCE_EAGER=True # true for faster debugging
 
@@ -135,6 +135,7 @@ DISTILLATION=(
     +distillation.distillation_loss.hybrid_mask_kwargs.use_low_coverage_rule=$HYBRID_MASK_USE_LOW_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
+    distillation.teacher_model.substitute_eos_token=True
 )
 
 STUDENT=(
@@ -209,7 +210,7 @@ echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"
 echo "SUPERVISED_LOSS_COEF: $SUPERVISED_LOSS_COEF"
-echo "NON-PARTIAL: MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
+echo "NON-PARTIAL (subeos): MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
 echo "================================================================================"
 
 python3 -m verl.trainer.main_ppo \

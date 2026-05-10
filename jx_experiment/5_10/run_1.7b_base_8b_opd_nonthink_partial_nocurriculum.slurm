@@ -1,14 +1,32 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#SBATCH --job-name=opd_1.7bBase_8b_nonthink_partial4_nocurric_0510
+#SBATCH --time=96:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=0
+#SBATCH --output='/home/jasonjx/on-policy-distillation/logs/slurm_outputs/%x_%j.out'
+#SBATCH --account=mrs_2
+#SBATCH --qos=h200_mrs_2_high
+#SBATCH --gpus-per-node=4
+#SBATCH --gpu-bind=verbose,closest
+
 set -xeuo pipefail
 
 ############################ Quick Config ############################
 
-source "$(dirname "$0")/../config.sh"
+# --- inlined config.sh ---
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate opd
+
+WANDB_API_KEY="c4b67c713ad88ef65b62908bcaa8b5c5cb72d1a9"
+export WANDB_ENTITY="${WANDB_ENTITY:-rl_agent}"
+PROJECT_NAME="verl_opd_dapo"
 
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=lllyx/Qwen3-1.7B-SFT
+STUDENT_MODEL=Qwen/Qwen3-1.7B-Base
 TEACHER_MODEL=Qwen/Qwen3-8B
 
 # Hybrid per-token partition of k1 PG and supervised forward_kl_topk.
@@ -41,7 +59,11 @@ SUPERVISED_LOSS_COEF=1.0
 DISTILLATION_LOSS_MAX_CLAMP=10.0
 DISTILLATION_LOG_PROB_MIN_CLAMP=-10.0
 
-MAX_PROMPT=2048
+# Partial rows append a teacher-prefix to the prompt; total context is held to
+# MAX_PROMPT + MAX_RESPONSE_LENGTH = 16382. Filter is on (re-enabled below) and
+# patched in rl_dataset.doc2len to count the partial; rows that don't fit are
+# dropped at load time.
+MAX_PROMPT=$(( 16382 - 4096 ))   # 12286
 MAX_RESPONSE_LENGTH=4096
 VAL_MAX_RESPONSE_LENGTH=8192
 MAX_NUM_TOKENS=$(( MAX_PROMPT + VAL_MAX_RESPONSE_LENGTH + 1 ))
@@ -64,12 +86,12 @@ ROLLOUT_N=1
 LR=1e-6
 train_batch_size=$(( TRAIN_PROMPT_BSZ ))
 
-EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}"
+EXP_NAME="fsdp/student-${STUDENT_MODEL}/teacher-${TEACHER_MODEL}/loss-${DISTILLATION_LOSS_MODE}/mask-opdt_p${HYBRID_MASK_TEACHER_TOP_P}_eps${HYBRID_MASK_ADV_EPS}_pg${PG_LOSS_COEF}_sup${SUPERVISED_LOSS_COEF}_b${train_batch_size}_n${ROLLOUT_N}_lr${LR}_reslen${MAX_RESPONSE_LENGTH}_partial4_nocurric_subeos"
 
 ENFORCE_EAGER=True # true for faster debugging
 
 ############################ Paths ############################
-DATA_PATH="${HOME}/data/dapo_17k_aime2426-suffix"
+DATA_PATH="/datasets/jasonjx/data-partial4"
 
 DAPO_TRAIN_PATH=$DATA_PATH/train.parquet
 DAPO_TEST_PATH=$DATA_PATH/test.parquet
@@ -92,8 +114,10 @@ DATA=(
     data.max_response_length=$MAX_RESPONSE_LENGTH
     data.train_batch_size=$TRAIN_PROMPT_BSZ
     data.filter_overlong_prompts=True
+    data.enable_partial=True
     data.truncation='error'
     data.shuffle=False
+    data.dataloader_num_workers=0
     +data.apply_chat_template_kwargs.enable_thinking=False
 )
 
@@ -135,6 +159,8 @@ DISTILLATION=(
     +distillation.distillation_loss.hybrid_mask_kwargs.use_low_coverage_rule=$HYBRID_MASK_USE_LOW_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
+    distillation.teacher_model.substitute_eos_token=True
+    distillation.loop_metrics.enabled=True
 )
 
 STUDENT=(
@@ -190,10 +216,21 @@ TRAINER=(
     trainer.resume_mode=disable
     trainer.max_actor_ckpt_to_keep=1
     trainer.log_val_generations=5
-    trainer.total_training_steps=240
+    trainer.total_training_steps=300
 )
 
 ############################ Launch ############################
+
+echo "=========================================="
+echo "On-Policy Distillation Job (5_10 Qwen3-1.7B-Base k1_topk_overlap NonThink Partial4 NoCurriculum)"
+echo "Job started: $(date)"
+echo "Host: $(hostname)"
+echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "Total GPUs: 4 (1 node x 4 GPUs)"
+echo "=========================================="
+
+cd /home/jasonjx/on-policy-distillation
 
 export VLLM_USE_V1=1
 export WANDB_API_KEY=$WANDB_API_KEY
@@ -209,7 +246,7 @@ echo "HYBRID_MASK_USE_NEGATIVE_RULE: $HYBRID_MASK_USE_NEGATIVE_RULE"
 echo "HYBRID_MASK_USE_POSITIVE_RULE: $HYBRID_MASK_USE_POSITIVE_RULE"
 echo "PG_LOSS_COEF: $PG_LOSS_COEF"
 echo "SUPERVISED_LOSS_COEF: $SUPERVISED_LOSS_COEF"
-echo "NON-PARTIAL: MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
+echo "PARTIAL (no curriculum): enable_partial=True, MAX_PROMPT=$MAX_PROMPT, DATA_PATH=$DATA_PATH"
 echo "================================================================================"
 
 python3 -m verl.trainer.main_ppo \
