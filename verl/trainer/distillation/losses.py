@@ -320,6 +320,11 @@ def _emit_topk_diagnostics(
                 metrics["distillation/opd_low_coverage_ratio"] = Metric(
                     AggregationType.MEAN, low_coverage_mask.sum().float() / total
                 )
+            if "opd_high_coverage_mask" in mask_extras:
+                high_coverage_mask = mask_extras["opd_high_coverage_mask"] & response_mask_bool
+                metrics["distillation/opd_high_coverage_ratio"] = Metric(
+                    AggregationType.MEAN, high_coverage_mask.sum().float() / total
+                )
 
     # --- Per-token PG/teacher direction conflict ratio (top-k modes only) ---
     # A position is "in conflict" if any teacher-supported top-p candidate would
