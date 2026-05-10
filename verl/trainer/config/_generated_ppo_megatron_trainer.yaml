@@ -793,6 +793,15 @@ distillation:
     supervised_loss_coef: 1.0
     hybrid_mask_strategy: oot
     hybrid_mask_kwargs: {}
+  loop_metrics:
+    _target_: verl.workers.config.LoopMetricsConfig
+    enabled: false
+    min_repeats: 2
+    min_pattern_tokens: 5
+    num_workers: 4
+    sample_fraction: 1.0
+    detector_mode: suffix
+    max_period_chunks: 64
   teacher_model:
     _target_: verl.workers.config.DistillationTeacherModelConfig
     enable_resource_pool: false

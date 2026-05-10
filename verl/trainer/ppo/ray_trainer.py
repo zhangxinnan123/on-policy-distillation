@@ -319,6 +319,9 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
 
+        # Lazy-init: built on first step when distillation.loop_metrics.enabled.
+        self._loop_metrics_pool = None
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -509,6 +512,44 @@ class RayPPOTrainer:
 
     def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
         return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
+
+    def _get_loop_metrics_cfg(self):
+        """Return the loop_metrics OmegaConf node if enabled, else None.
+
+        Allowed independently of distillation.enabled — a user may want loop
+        diagnostics on a plain RL run too.
+        """
+        dist_cfg = self.config.get("distillation", None) if hasattr(self.config, "get") else None
+        if dist_cfg is None:
+            return None
+        loop_cfg = dist_cfg.get("loop_metrics", None) if hasattr(dist_cfg, "get") else None
+        if loop_cfg is None or not loop_cfg.get("enabled", False):
+            return None
+        return loop_cfg
+
+    def _get_or_init_loop_metrics_pool(self):
+        """Lazy-init the LoopMetricsPool on first use. Returns None if init fails;
+        loop metrics are best-effort and must never block training.
+        """
+        if self._loop_metrics_pool is not None:
+            return self._loop_metrics_pool
+        loop_cfg = self._get_loop_metrics_cfg()
+        if loop_cfg is None:
+            return None
+        try:
+            from verl.trainer.distillation.loop_metrics import LoopMetricsPool
+
+            tok_name = getattr(self.tokenizer, "name_or_path", None) or self.config.actor_rollout_ref.model.path
+            self._loop_metrics_pool = LoopMetricsPool(
+                tokenizer_name_or_path=tok_name,
+                num_workers=int(loop_cfg.get("num_workers", 4)),
+                inline_tokenizer=self.tokenizer if int(loop_cfg.get("num_workers", 4)) <= 0 else None,
+            )
+            return self._loop_metrics_pool
+        except Exception as e:
+            print(f"[loop_metrics] failed to init pool: {e!r}; disabling for this run.")
+            self._loop_metrics_pool = None
+            return None
 
     def _compute_teacher_colocate(self, batch: DataProto) -> DataProto:
         """Compute teacher logprobs after rollout when teacher and student are colocated."""
@@ -1444,6 +1485,32 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Optional driver-side loop-detection diagnostics. Best-effort:
+                    # a failure here never blocks training.
+                    loop_cfg = self._get_loop_metrics_cfg()
+                    if loop_cfg is not None:
+                        with marked_timer("loop_metrics", timing_raw, color="magenta"):
+                            try:
+                                pool = self._get_or_init_loop_metrics_pool()
+                                if pool is not None:
+                                    from verl.trainer.distillation.loop_metrics import compute_loop_metrics
+
+                                    loop_metrics_out = compute_loop_metrics(
+                                        token_ids_2d=batch.batch["responses"],
+                                        response_mask_2d=batch.batch["response_mask"],
+                                        pool=pool,
+                                        min_repeats=int(loop_cfg.get("min_repeats", 2)),
+                                        min_pattern_tokens=int(loop_cfg.get("min_pattern_tokens", 5)),
+                                        sample_fraction=float(loop_cfg.get("sample_fraction", 1.0)),
+                                        rng_seed=self.global_steps,
+                                        mode=str(loop_cfg.get("detector_mode", "suffix")),
+                                        max_period_chunks=int(loop_cfg.get("max_period_chunks", 64)),
+                                    )
+                                    metrics.update(loop_metrics_out)
+                            except Exception as e:
+                                print(f"[loop_metrics] step {self.global_steps}: {e!r}; skipping.")
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

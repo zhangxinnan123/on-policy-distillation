@@ -21,7 +21,12 @@ from verl.base_config import BaseConfig
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = [
+    "DistillationLossConfig",
+    "DistillationTeacherModelConfig",
+    "DistillationConfig",
+    "LoopMetricsConfig",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -182,6 +187,55 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 
 @dataclass
+class LoopMetricsConfig(BaseConfig):
+    """Driver-side loop-detection metrics computed on student rollouts.
+
+    When enabled, after generate_sequences each step the driver decodes the
+    rollout responses and runs opd_inference.loop_analysis.detect_loop on each
+    row across a small Ray actor pool. Scalar aggregates land in the wandb
+    metrics dict under the 'distillation/loop_*' namespace. No effect on loss
+    or reward — purely diagnostic.
+
+    enabled (bool):
+        Master switch. Default False so this is a no-op until a script opts in.
+    min_repeats (int):
+        Minimum consecutive repetitions that count as a loop.
+    min_pattern_tokens (int):
+        Reject loops whose pattern is shorter than this many tokens.
+    num_workers (int):
+        Size of the driver-side Ray actor pool used to parallelize detection.
+        Each actor loads its own tokenizer copy. Set to 0 to run inline on the
+        driver (useful for tests / debugging).
+    sample_fraction (float):
+        Fraction of rollouts in the batch to run detection on, in (0, 1]. Use
+        <1.0 to amortize cost when batches are large. Sampling is deterministic
+        per step for reproducibility.
+    """
+
+    _mutable_fields = BaseConfig._mutable_fields
+
+    enabled: bool = False
+    min_repeats: int = 2
+    min_pattern_tokens: int = 5
+    num_workers: int = 4
+    sample_fraction: float = 1.0
+    # Chunk-scan mode passed to detect_loop. "suffix" only checks loops anchored
+    # at the response end (≈10–100× faster on long non-looping responses, and
+    # catches every "model collapsed at the end" case); "full" scans every
+    # (start, period) pair so it also detects mid-response loops. "suffix" is
+    # the right default for training-time monitoring.
+    detector_mode: str = "suffix"
+    # Cap on the cycle length considered in suffix mode (in chunks).
+    max_period_chunks: int = 64
+
+    def __post_init__(self):
+        if self.detector_mode not in ("full", "suffix"):
+            raise ValueError(
+                f"loop_metrics.detector_mode must be 'full' or 'suffix', got {self.detector_mode!r}"
+            )
+
+
+@dataclass
 class DistillationConfig(BaseConfig):
     """Configuration for on-policy distillation.
 
@@ -193,6 +247,8 @@ class DistillationConfig(BaseConfig):
         Configuration for the teacher model used for distillation.
     distillation_loss (DistillationLossConfig):
         Configuration for distillation loss settings.
+    loop_metrics (LoopMetricsConfig):
+        Optional driver-side loop-detection metrics on student rollouts.
     """
 
     _mutable_fields = BaseConfig._mutable_fields
@@ -201,6 +257,7 @@ class DistillationConfig(BaseConfig):
     num_workers: int = 8
     teacher_model: DistillationTeacherModelConfig = field(default_factory=DistillationTeacherModelConfig)
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    loop_metrics: LoopMetricsConfig = field(default_factory=LoopMetricsConfig)
 
     def __post_init__(self):
         # Prompt + Response from student are fed into teacher as context

@@ -76,6 +76,28 @@ distillation_loss:
   hybrid_mask_kwargs: {}
 
 
+# Optional driver-side loop-detection metrics on student rollouts.
+# When enabled, the trainer runs opd_inference.loop_analysis.detect_loop on each
+# rollout response after generate_sequences and logs scalar aggregates to wandb
+# under the "distillation/loop_*" namespace. Diagnostic only; does not touch
+# loss or reward.
+loop_metrics:
+  _target_: verl.workers.config.LoopMetricsConfig
+  enabled: false
+  min_repeats: 2
+  min_pattern_tokens: 5
+  # Driver-side Ray actor pool size; 0 runs inline on the driver.
+  num_workers: 4
+  # Fraction of rollouts in the batch to run detection on, in (0, 1].
+  sample_fraction: 1.0
+  # Chunk-scan mode: "suffix" (fast — only loops anchored at the response end)
+  # or "full" (slow — also catches mid-response loops). "suffix" is the right
+  # default for training-time monitoring.
+  detector_mode: suffix
+  # Cap on the cycle length (in chunks) considered in suffix mode.
+  max_period_chunks: 64
+
+
 # teacher model config
 teacher_model:
   _target_: verl.workers.config.DistillationTeacherModelConfig
