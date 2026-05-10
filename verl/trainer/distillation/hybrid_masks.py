@@ -54,6 +54,10 @@ class HybridMaskContext:
     # Computed in fsdp/losses.py via the logsumexp identity exp(logsumexp(2x) − 2·log_Z).
     student_s2: Optional[torch.Tensor] = None
     mask_kwargs: dict = field(default_factory=dict)
+    # Strategy-populated diagnostic tensors (e.g. opd_theory_guided's per-position
+    # conflict / low-coverage masks). Returned to losses.py as `mask_extras` and
+    # forwarded to _emit_topk_diagnostics for metric logging.
+    extras: dict = field(default_factory=dict)
 
 
 MaskReturn = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
@@ -235,10 +239,12 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
         )
 
     student_low_threshold = float(ctx.mask_kwargs.get("student_low_threshold", 1e-2))
+    student_high_threshold = float(ctx.mask_kwargs.get("student_high_threshold", 0.95))
     teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
     adv_eps = float(ctx.mask_kwargs.get("adv_eps", 0.0))
 
     use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+    use_high_coverage_rule = bool(ctx.mask_kwargs.get("use_high_coverage_rule", True))
     use_direction_rule = bool(ctx.mask_kwargs.get("use_direction_rule", True))
 
     s2 = ctx.student_s2  # (B, T)
@@ -304,10 +310,20 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     # so PG/RKL cannot reliably recover this missing mode.
     low_student_coverage = (pi_c < student_low_threshold) & want_increase_c  # (B, T, K)
 
+    # Saturation failure:
+    # teacher wants c lower, but pi_c is near 1. The PG bracket
+    # [S2 - pi_a - pi_c] -> 0 (since S2 -> pi_c^2 -> 1, pi_a -> 0), so
+    # |Delta pi(c)| vanishes even though sign(k1 * bracket) might still be
+    # correct. PG cannot move c down efficiently from a saturated state.
+    high_student_coverage = (pi_c > student_high_threshold) & want_decrease_c  # (B, T, K)
+
     need_fkl_per_c = torch.zeros_like(teacher_candidate, dtype=torch.bool)
 
     if use_low_coverage_rule:
         need_fkl_per_c |= low_student_coverage
+
+    if use_high_coverage_rule:
+        need_fkl_per_c |= high_student_coverage
 
     if use_direction_rule:
         need_fkl_per_c |= direction_conflict
@@ -328,6 +344,10 @@ def _mask_opd_theory_guided(ctx: HybridMaskContext) -> torch.Tensor:
     if use_low_coverage_rule:
         low_coverage_per_position = (low_student_coverage & teacher_candidate).any(dim=-1)  # (B, T)
         ctx.extras["opd_low_coverage_mask"] = low_coverage_per_position
+
+    if use_high_coverage_rule:
+        high_coverage_per_position = (high_student_coverage & teacher_candidate).any(dim=-1)  # (B, T)
+        ctx.extras["opd_high_coverage_mask"] = high_coverage_per_position
 
     return pg_mask
 
