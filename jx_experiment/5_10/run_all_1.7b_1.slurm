@@ -36,8 +36,6 @@ SCRIPTS=(
     "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_partial.slurm"
     "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_partial_nocurriculum.slurm"
     "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink.slurm"
-    "jx_experiment/5_10/run_1.7b_base_8b_opd_nonthink_subeos.slurm"
-    "jx_experiment/5_10/run_1.7b_SFT_8b_opd_nonthink.slurm"
 )
 
 declare -a RESULTS=()
