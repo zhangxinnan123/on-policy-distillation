@@ -157,7 +157,7 @@ DISTILLATION=(
     +distillation.distillation_loss.hybrid_mask_kwargs.use_high_coverage_rule=$HYBRID_MASK_USE_HIGH_COVERAGE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_negative_rule=$HYBRID_MASK_USE_NEGATIVE_RULE
     +distillation.distillation_loss.hybrid_mask_kwargs.use_positive_rule=$HYBRID_MASK_USE_POSITIVE_RULE
-    distillation.teacher_model.substitute_eos_token=True
+    +distillation.teacher_model.substitute_eos_token=True
 )
 
 STUDENT=(
