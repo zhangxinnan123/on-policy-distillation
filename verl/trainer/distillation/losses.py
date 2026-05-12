@@ -294,7 +294,7 @@ def _emit_topk_diagnostics(
             response_mask_bool=response_mask_bool,
         )
         if diag is not None:
-            pg_mask, sup_mask, k1_per_token = diag
+            pg_mask, sup_mask, k1_per_token, mask_extras = diag
 
     if pg_mask is not None and k1_per_token is not None:
         total = response_mask_bool.sum().clamp(min=1).float()
@@ -407,11 +407,13 @@ def _compute_pg_diag_for_non_hybrid(
     data: TensorDict,
     distillation_config: DistillationConfig,
     response_mask_bool: torch.Tensor,
-) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]]:
     """Simulate the PG/sup partition under the configured ``hybrid_mask_strategy``
     so non-hybrid top-k losses can surface the same routing diagnostic that
-    hybrid losses emit. Returns ``(pg_mask, sup_mask, k1_per_token)`` or
-    ``None`` if the strategy can't run on what the kernel surfaced.
+    hybrid losses emit. Returns ``(pg_mask, sup_mask, k1_per_token, mask_extras)``
+    or ``None`` if the strategy can't run on what the kernel surfaced. The
+    ``mask_extras`` dict carries strategy-populated diagnostic tensors (e.g.
+    opd_theory_guided's per-position conflict / low-coverage / high-coverage masks).
     """
     from verl.trainer.distillation.hybrid_masks import MASK_REGISTRY, HybridMaskContext, get_mask_fn
 
@@ -471,7 +473,7 @@ def _compute_pg_diag_for_non_hybrid(
     else:
         pg_mask = mask_result.bool() & response_mask_bool
         sup_mask = response_mask_bool & ~pg_mask
-    return pg_mask, sup_mask, k1_per_token
+    return pg_mask, sup_mask, k1_per_token, ctx.extras
 
 
 def compute_topk_loss(

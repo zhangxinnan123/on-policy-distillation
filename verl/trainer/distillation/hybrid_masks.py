@@ -127,6 +127,33 @@ def _mask_teacher_conf(ctx: HybridMaskContext) -> torch.Tensor:
     return teacher_top1_prob < threshold
 
 
+@register_mask("teacher_topk_entropy")
+def _mask_teacher_topk_entropy(ctx: HybridMaskContext) -> torch.Tensor:
+    """PG where teacher's top-k entropy is *below* a threshold (teacher peaky).
+
+    Renormalize teacher's top-k slice to a proper distribution, then compute
+        H(p_topk) = -Σ_{c ∈ topk} p̂(c) · log p̂(c)        (nats)
+    where p̂(c) = pi_T(c) / Σ_{c' ∈ topk} pi_T(c').
+
+    Routing intent:
+      - H high  → teacher diffuse → many candidates carry mass → FKL provides
+        a richer dense signal than k1 PG → route to supervised arm.
+      - H low   → teacher near-deterministic → mass on one or two tokens →
+        PG/k1 update at the sampled token is sufficient.
+
+    Strategy kwargs:
+      threshold (float, default 1.0): if H_topk ≥ threshold → FKL (not PG).
+        Bounded above by log(K). For K=16, H_max ≈ 2.77 nats; threshold=1.0
+        sits roughly at the midpoint.
+    """
+    threshold = float(ctx.mask_kwargs.get("threshold", 1.0))
+    p = ctx.teacher_topk_logprobs.exp()  # (B, T, K) — raw teacher probs (sum < 1)
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    log_p = p.clamp_min(1e-12).log()
+    h = -(p * log_p).sum(dim=-1)  # (B, T) entropy in nats
+    return h < threshold
+
+
 @register_mask("disagreement")
 def _mask_disagreement(ctx: HybridMaskContext) -> torch.Tensor:
     """PG where the student-sampled token differs from teacher's top-1 id.
@@ -524,3 +551,188 @@ def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
     sup_mask = torch.zeros_like(pg_mask)
     return pg_mask, sup_mask
 
+
+
+
+@register_mask("opd_theory_guided2")
+def _mask_opd_theory_guided2(ctx: HybridMaskContext) -> torch.Tensor:
+    """
+    Theory-guided OPD routing on the teacher's top-p nucleus.
+
+    Return:
+        pg_mask: (B, T)  True -> PG/RKL update, False -> FKL update
+
+    -------------------------------------------------------------------
+    Per-candidate FKL signals (c in teacher nucleus, c != u):
+      (R1) low coverage:   pi_T(c) / pi_S(c) > 1 + eps_low
+           Teacher mass dominates student mass. PG amplitude on c is
+           O(pi_S(c)) by softmax Jacobian, so RKL cannot recover this
+           missing mode.
+
+      (R2) high coverage:  pi_S(c) / pi_T(c) > 1 + eps_high
+           Student over-shoots teacher at c. The PG bracket
+           [S2 - pi_S(u) - pi_S(c)] shrinks as pi_S(c) saturates,
+           so RKL cannot move c down efficiently.
+
+      (R3) direction conflict:
+           PG-induced sign(Delta pi(c)) opposes teacher-desired sign,
+           i.e. PG would push c away from teacher.
+
+    -------------------------------------------------------------------
+    Position-level FKL signal:
+      (R4) sampled overshoot:
+           pi_S(u) / pi_T(u) > 1 + eps_high  AND  pi_S(u) > floor
+           Sampled-token amplitude is O((1-p)^2); PG cannot pull mass
+           away from a saturated u even if direction is correct.
+
+    -------------------------------------------------------------------
+    Aggregation:
+      Per-candidate signals are aggregated via teacher-mass-weighted
+      vote (not `any`), so a tail candidate with negligible teacher
+      mass cannot flip the entire position.
+
+    Asymmetric epsilons:
+      eps_low  < eps_high  (default 0.5 < 2.0)
+      - Undercoverage is a structural failure of RKL: amplitude is
+        O(pi_S(c)) by softmax Jacobian; routing must be sensitive.
+      - Overshoot is slow but recoverable under RKL; routing should
+        be conservative to preserve mode sharpening.
+
+    Equivalent log-domain form (advantage thresholds):
+      pi_S(c) / pi_T(c) > 1 + eps  <=>  -A(s,c) > log(1 + eps).
+    """
+
+    if ctx.student_topk_probs is None or ctx.student_s2 is None:
+        raise ValueError(
+            "opd_theory_guided requires student_topk_probs and student_s2."
+        )
+
+    # ----------------- Hyperparameters --------------------------------
+    eps_high = float(ctx.mask_kwargs.get("eps_high", 2.0))   # overshoot, conservative
+    eps_low  = float(ctx.mask_kwargs.get("eps_low",  0.5))   # undercoverage, sensitive
+
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
+
+    # Numerical margin around 0 for PG direction sign.
+    adv_eps = float(ctx.mask_kwargs.get("adv_eps", 0.0))
+
+    # Mass-vote threshold for position-level routing.
+    fkl_vote_threshold = float(ctx.mask_kwargs.get("fkl_vote_threshold", 0.3))
+
+    # Absolute floor for sampled-token saturation rule.
+    sampled_overshoot_floor = float(
+        ctx.mask_kwargs.get("sampled_overshoot_floor", 0.5)
+    )
+
+    # Probability floor for ratio numerical stability.
+    prob_floor = float(ctx.mask_kwargs.get("prob_floor", 1e-6))
+
+    # Rule toggles for ablation.
+    use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+    use_high_coverage_rule = bool(ctx.mask_kwargs.get("use_high_coverage_rule", True))
+    use_direction_rule = bool(ctx.mask_kwargs.get("use_direction_rule", True))
+    use_sampled_saturation_rule = bool(
+        ctx.mask_kwargs.get("use_sampled_saturation_rule", True)
+    )
+
+    r_high = 1.0 + eps_high
+    r_low = 1.0 + eps_low
+
+    # ----------------- Inputs -----------------------------------------
+    s2   = ctx.student_s2                          # (B, T)
+    pi_c = ctx.student_topk_probs                  # (B, T, K)
+    pi_a = ctx.student_log_prob_at_sampled.exp()   # (B, T)
+
+    teacher_ids   = ctx.teacher_topk_ids                       # (B, T, K)
+    teacher_probs = ctx.teacher_topk_logprobs.exp()            # (B, T, K)
+
+    sampled_ids  = ctx.student_sampled_ids.unsqueeze(-1)       # (B, T, 1)
+    sampled_at_c = teacher_ids == sampled_ids                  # (B, T, K)
+
+    # A(s,u) = log pi_T(u) - log pi_S(u).
+    # ctx.k1_per_token is stored as log pi_S(u) - log pi_T(u), so negate.
+    k1 = -ctx.k1_per_token                                     # (B, T)
+    k1_b = k1.unsqueeze(-1)                                    # (B, T, 1)
+
+    # ----------------- Teacher nucleus --------------------------------
+    shifted_cumsum = torch.cat(
+        [
+            torch.zeros_like(teacher_probs[..., :1]),
+            teacher_probs.cumsum(dim=-1)[..., :-1],
+        ],
+        dim=-1,
+    )
+    teacher_candidate = shifted_cumsum < teacher_top_p          # (B, T, K)
+
+    # ----------------- PG-induced direction at each c -----------------
+    # For c == u: sign(Delta pi(u)) = sign(A) = sign(k1).
+    # For c != u: sign(Delta pi(c)) = sign(A * (S2 - pi_S(u) - pi_S(c))).
+    bracket = s2.unsqueeze(-1) - pi_a.unsqueeze(-1) - pi_c
+    pg_dir_value = torch.where(sampled_at_c, k1_b, k1_b * bracket)
+    pg_raises_c = pg_dir_value >  adv_eps
+    pg_lowers_c = pg_dir_value < -adv_eps
+
+    # ----------------- Ratios with numerical floor --------------------
+    pi_c_safe = pi_c.clamp_min(prob_floor)
+    pi_T_safe = teacher_probs.clamp_min(prob_floor)
+
+    # ----------------- Per-candidate FKL signals (R1, R2, R3) ---------
+    low_student_coverage  = (pi_T_safe / pi_c_safe) > r_low                    # R1
+    high_student_coverage = ((pi_c_safe / pi_T_safe) > r_high) & (~sampled_at_c)  # R2
+
+    want_increase_c = teacher_probs > pi_c
+    want_decrease_c = teacher_probs < pi_c
+    direction_conflict = (                                                      # R3
+        (want_increase_c & pg_lowers_c) | (want_decrease_c & pg_raises_c)
+    )
+
+    need_fkl_per_c = torch.zeros_like(teacher_candidate)
+    if use_low_coverage_rule:
+        need_fkl_per_c |= low_student_coverage
+    if use_high_coverage_rule:
+        need_fkl_per_c |= high_student_coverage
+    if use_direction_rule:
+        need_fkl_per_c |= direction_conflict
+    need_fkl_per_c &= teacher_candidate
+
+    # ----------------- Mass-weighted position vote --------------------
+    fkl_mass   = (teacher_probs * need_fkl_per_c.float()).sum(dim=-1)         # (B, T)
+    total_mass = (teacher_probs * teacher_candidate.float()).sum(dim=-1).clamp_min(1e-8)
+    fkl_vote   = fkl_mass / total_mass                                        # (B, T)
+
+    fkl_position = fkl_vote > fkl_vote_threshold
+
+    # ----------------- Position-level sampled overshoot (R4) ----------
+    sampled_overshoot = torch.zeros_like(fkl_position)
+    if use_sampled_saturation_rule:
+        pi_T_at_a       = (teacher_probs * sampled_at_c.float()).sum(dim=-1)  # (B, T)
+        sampled_in_topk = sampled_at_c.any(dim=-1)
+        pi_a_safe       = pi_a.clamp_min(prob_floor)
+        pi_T_at_a_safe  = pi_T_at_a.clamp_min(prob_floor)
+        sampled_overshoot = (
+            sampled_in_topk
+            & ((pi_a_safe / pi_T_at_a_safe) > r_high)
+            & (pi_a > sampled_overshoot_floor)
+        )
+        fkl_position = fkl_position | sampled_overshoot
+
+    pg_mask = ~fkl_position
+
+    # ----------------- Diagnostics ------------------------------------
+    if use_direction_rule:
+        ctx.extras["opd_conflict_mask"] = (
+            direction_conflict & teacher_candidate
+        ).any(dim=-1)
+    if use_low_coverage_rule:
+        ctx.extras["opd_low_coverage_mask"] = (
+            low_student_coverage & teacher_candidate
+        ).any(dim=-1)
+    if use_high_coverage_rule:
+        ctx.extras["opd_high_coverage_mask"] = (
+            high_student_coverage & teacher_candidate
+        ).any(dim=-1)
+    if use_sampled_saturation_rule:
+        ctx.extras["opd_sampled_overshoot_mask"] = sampled_overshoot
+    ctx.extras["opd_fkl_vote"] = fkl_vote
+
+    return pg_mask
