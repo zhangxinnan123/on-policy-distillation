@@ -76,7 +76,17 @@ def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
-    return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+    if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        return True
+    # SDPO modify_ref_prompt with a FROZEN teacher needs a real Role.RefPolicy
+    # worker. When use_current_actor=True (default), the trainer aliases the
+    # actor and no separate worker is required, so we don't trigger here.
+    sdpo_cfg = config.get("sdpo") if hasattr(config, "get") else None
+    if sdpo_cfg is not None:
+        mrp = sdpo_cfg.get("modify_ref_prompt", None) if hasattr(sdpo_cfg, "get") else None
+        if mrp is not None and mrp.get("enabled", False) and not mrp.get("use_current_actor", True):
+            return True
+    return False
 
 
 def need_teacher_policy(
