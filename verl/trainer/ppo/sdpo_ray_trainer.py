@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -236,6 +237,42 @@ def compute_sdpo_grpo_advantage(
 # Filled in by `compute_sdpo_grpo_advantage`; the trainer reads this immediately
 # after the call to surface per-step regime counts as wandb metrics.
 _LAST_SDPO_REGIME_COUNTS: dict = {}
+
+
+def sign_flip_decay_multiplier(
+    step: int,
+    total_steps: int,
+    decay_type: str = "cosine",
+    final_scale: float = 0.0,
+    warmup_steps: int = 0,
+) -> float:
+    """Multiplier in [final_scale, 1.0] applied to the SDPO sign-flip lambdas.
+
+    The "self-distilled KL" delta = log π_θ(y|x,e) - log π_θ(y|x) is weighted by
+    sign_flip_lambda_{pos,neg}. This schedule decays those lambdas from their
+    configured value (multiplier 1.0) toward `final_scale` (default 0.0 == fully
+    off) over `total_steps`, so the hint signal fades as the policy matures.
+
+    progress = clip((step - warmup) / (total - warmup), 0, 1)
+      cosine: final + 0.5*(1-final)*(1+cos(pi*progress))   (smooth, default)
+      linear: final + (1-final)*(1-progress)               (constant rate)
+
+    During warmup (step <= warmup_steps) the multiplier stays 1.0.
+    """
+    if total_steps <= 0:
+        return 1.0
+    if step <= warmup_steps:
+        return 1.0
+    denom = max(1, total_steps - warmup_steps)
+    progress = (step - warmup_steps) / denom
+    progress = min(1.0, max(0.0, progress))
+    if decay_type == "linear":
+        m = final_scale + (1.0 - final_scale) * (1.0 - progress)
+    elif decay_type == "cosine":
+        m = final_scale + 0.5 * (1.0 - final_scale) * (1.0 + math.cos(math.pi * progress))
+    else:
+        raise ValueError(f"unknown sign_flip decay_type: {decay_type!r} (expected 'cosine' or 'linear')")
+    return m
 
 
 def _fill_grpo_advantages(
@@ -2643,7 +2680,42 @@ class RayPPOTrainer:
                             # double-counting. The previous defensive assert is removed.
                             sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
                             grpo_knobs = sdpo_cfg.get("sdpo_grpo", None) if (sdpo_cfg is not None and hasattr(sdpo_cfg, "get")) else None
-                            batch.meta_info["sdpo_grpo"] = grpo_knobs if grpo_knobs is not None else {}
+                            # Materialize into a plain mutable dict so we can apply the
+                            # sign-flip decay schedule without mutating the OmegaConf node.
+                            if grpo_knobs is None:
+                                grpo_knobs = {}
+                            elif not isinstance(grpo_knobs, dict):
+                                grpo_knobs = OmegaConf.to_container(grpo_knobs, resolve=True)
+                            else:
+                                grpo_knobs = dict(grpo_knobs)
+
+                            # Self-distilled KL decay: scale sign_flip_lambda_{pos,neg}
+                            # toward final_scale (default 0) over training so the hint
+                            # delta = log π_θ(y|x,e) - log π_θ(y|x) fades as the policy
+                            # matures. Configured under sdpo.sdpo_grpo.sign_flip_decay.
+                            decay_cfg = grpo_knobs.get("sign_flip_decay", None)
+                            if decay_cfg is not None and bool(decay_cfg.get("enabled", False)):
+                                total_steps = int(
+                                    decay_cfg.get("total_steps", 0)
+                                    or self.config.trainer.get("total_training_steps", 0)
+                                    or 0
+                                )
+                                mult = sign_flip_decay_multiplier(
+                                    step=self.global_steps,
+                                    total_steps=total_steps,
+                                    decay_type=str(decay_cfg.get("decay_type", "cosine")),
+                                    final_scale=float(decay_cfg.get("final_scale", 0.0)),
+                                    warmup_steps=int(decay_cfg.get("warmup_steps", 0)),
+                                )
+                                base_pos = float(grpo_knobs.get("sign_flip_lambda_pos", 0.0))
+                                base_neg = float(grpo_knobs.get("sign_flip_lambda_neg", 0.0))
+                                grpo_knobs["sign_flip_lambda_pos"] = base_pos * mult
+                                grpo_knobs["sign_flip_lambda_neg"] = base_neg * mult
+                                metrics["sdpo/sign_flip/decay_mult"] = mult
+                                metrics["sdpo/sign_flip/lambda_pos_eff"] = base_pos * mult
+                                metrics["sdpo/sign_flip/lambda_neg_eff"] = base_neg * mult
+
+                            batch.meta_info["sdpo_grpo"] = grpo_knobs
 
                         batch = compute_advantage(
                             batch,
