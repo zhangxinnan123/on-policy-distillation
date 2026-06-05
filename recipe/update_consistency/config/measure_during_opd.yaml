@@ -1,0 +1,76 @@
+# Config for the in-flight update-consistency experiment.
+#
+# Inherits everything from ppo_trainer.yaml (so all the usual actor / rollout /
+# distillation / teacher knobs are available), then adds the
+# `update_consistency:` section and pins a few values the experiment requires.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+
+  - ppo_trainer
+
+  - _self_
+
+# === Update-consistency settings ===
+update_consistency:
+
+  # Where measurements.parquet (and any future per-step artifacts) are saved.
+  output_dir: ???
+
+  # How often (in trainer global_steps) to take a before/after snapshot.
+  measure_every: 1
+
+  # Single-token control: when true, before super()._update_actor we override
+  # response_mask to be 1-hot at a single randomly chosen (i*, j*) so the
+  # optimizer step's gradient comes from exactly ONE response token. After
+  # the step, the original mask is restored and Δπ is measured at ALL valid
+  # positions; non-target positions then quantify NTK off-diagonal coupling.
+  # Adds columns target_i, target_j, is_target to measurements.parquet.
+  single_token_mode: false
+
+  # RNG seed for the random target-position selection (only used when
+  # single_token_mode=true).
+  seed: 0
+
+  # If true, on the first measurement step take TWO snapshots back-to-back
+  # with NO optimizer step between them, and log the per-key max/mean abs
+  # difference. Quantifies the forward-pass noise floor — if log_probs /
+  # student_topk_probs differ across two identical forwards, every Δπ we
+  # report later includes that noise. Useful for diagnosing torch.compile /
+  # flash-attention / bf16 nondeterminism.
+  noise_check: false
+
+# === Pinned values for the experiment ===
+
+# The theory's derivation is per-optimizer-step. ppo_epochs=1 + a single
+# mini-batch makes each trainer iteration exactly one optimizer.step.
+actor_rollout_ref:
+
+  actor:
+
+    ppo_epochs: 1
+
+# Training-loss settings. k1_topk_overlap + use_policy_gradient=True gives the
+# REINFORCE single-sample reverse-KL update predicted by the theory, AND its
+# logits-processor hook emits student_topk_probs (at teacher top-K) and
+# student_s2 (||π_θ||²) into model_output — exactly what the callback reads.
+distillation:
+
+  enabled: true
+
+  distillation_loss:
+
+    loss_mode: k1_topk_overlap
+
+    topk: 100
+
+    use_policy_gradient: true
+
+    use_task_rewards: false
+
+trainer:
+
+  use_legacy_worker_impl: disable
