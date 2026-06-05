@@ -463,32 +463,42 @@ def _mask_opd_aligned(ctx: HybridMaskContext) -> torch.Tensor:
 
 @register_mask("opd_drop_conflict")
 def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
-    """Drop positions where the PG step is predicted to increase RKL on the
-    teacher nucleus.
+    """Drop positions where the PG step is predicted to be harmful on the
+    teacher nucleus. Same three-signal detection as `opd_theory_guided3`, but
+    flagged positions are *dropped* (contribute to no loss) instead of being
+    routed to an FKL arm. Remaining positions get the PG (k1) update.
 
-    Per teacher-nucleus candidate c, build a signed proxy for the PG-induced
-    change in pi_S:
+    Signals (per §3.3):
 
-        c == a:  Δpi(a) ∝ k1 · pi_a · (1 − 2·pi_a + S2)        (bracket ≥ 0)
-        c != a:  Δpi(c) ∝ k1 · pi_c · (S2 − pi_a − pi_c)
+      M1 (sampled saturation):
+          pi_S(u) / pi_T(u) > 1 + eps_high  AND  pi_S(u) > floor
+          Sampled-token amplitude p(1-p)^2 prevents PG from pulling p back down.
 
-    where k1 = log pi_T(a) − log pi_S(a). The signed score is
+      M2 (non-sampled direction conflict):
+          sign(Delta pi(c)) opposes sign(pi_T(c) - pi_S(c))
+          PG would push c away from teacher's intent.
 
-        score = Σ_{c ∈ nucleus} (log pi_T(c) − log pi_S(c)) · Δpi_proxy(c)
+      M3 (non-sampled low coverage):
+          pi_T(c) / pi_S(c) > 1 + eps_low
+          Low pi_S(c) caps PG amplitude at the candidate's own probability, so
+          RKL cannot recover the missing mode.
 
-    Using Σ_c Δpi(c) = 0 (over full vocab), this equals −Δ D_KL(pi_S || pi_T)
-    to first order in the PG step (restricted to the nucleus). Sign:
-      score > 0  →  PG decreases RKL on the nucleus (helpful)
-      score < 0  →  PG increases RKL on the nucleus (harmful)
+    Aggregation:
+      Per-candidate signals (M2, M3) are aggregated by teacher-mass-weighted
+      vote on the teacher top-p nucleus; a tail candidate with negligible
+      teacher mass cannot flip the entire position. Position is dropped iff
+      vote > drop_vote_threshold OR M1 fires.
 
-    Drop iff score < drop_threshold. With drop_threshold=0, drop net-harmful
-    positions. Higher thresholds additionally drop weakly-helpful positions.
-    Remaining positions get the PG (k1) update. No FKL arm.
-
-    Strategy kwargs:
-      teacher_top_p (float, default 0.95): nucleus mass for teacher candidates.
-      drop_threshold (float, default 0.0): drop iff score < threshold. Tune
-        via `distillation/dropped_token_ratio`.
+    Optional advantage-percentile drop (mirrors `advantage_mask_percent` in
+    losses.py): if `advantage_mask_percent` kwarg is set, additionally drop
+    tokens whose per-token advantage A(s,u) = log pi_T(u) - log pi_S(u) lies
+    in the middle (1 - p) of the distribution — e.g. 0.9 keeps only the
+    extreme top 5% and bottom 5%. Percentiles are computed over the
+    *origin* response mask (full response tokens, not the M1/M2/M3-remaining
+    subset) and globally across DP ranks when torch.distributed is
+    initialized. The downstream loss aggregator normalizes by the original
+    full batch_num_tokens (the "origin" denominator), so dropping more
+    tokens reduces — rather than rescales — the per-arm loss contribution.
     """
 
     if ctx.student_topk_probs is None or ctx.student_s2 is None:
@@ -498,18 +508,53 @@ def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
             "in fsdp/losses.py (FSDP backend only)."
         )
 
-    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.95))
-    drop_threshold = float(ctx.mask_kwargs.get("drop_threshold", 0.0))
+    # ----------------- Hyperparameters --------------------------------
+    eps_high = float(ctx.mask_kwargs.get("eps_high", 2.0))   # overshoot, conservative
+    eps_low  = float(ctx.mask_kwargs.get("eps_low",  0.5))   # undercoverage, sensitive
 
-    s2 = ctx.student_s2  # (B, T)
-    pi_c = ctx.student_topk_probs  # (B, T, K)
-    pi_a = ctx.student_log_prob_at_sampled.exp()  # (B, T)
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
 
-    teacher_ids = ctx.teacher_topk_ids  # (B, T, K)
-    teacher_logp = ctx.teacher_topk_logprobs  # (B, T, K)
-    teacher_probs = teacher_logp.exp()  # (B, T, K)
+    # Numerical margin around 0 for PG direction sign.
+    adv_eps = float(ctx.mask_kwargs.get("adv_eps", 0.0))
 
-    # Teacher candidate set: top-p nucleus inside teacher top-k.
+    # Mass-vote threshold for position-level drop decision.
+    drop_vote_threshold = float(ctx.mask_kwargs.get("drop_vote_threshold", 0.3))
+
+    # Absolute floor for sampled-token saturation rule.
+    sampled_overshoot_floor = float(
+        ctx.mask_kwargs.get("sampled_overshoot_floor", 0.5)
+    )
+
+    # Probability floor for ratio numerical stability.
+    prob_floor = float(ctx.mask_kwargs.get("prob_floor", 1e-6))
+
+    # Rule toggles for ablation.
+    use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+    use_direction_rule = bool(ctx.mask_kwargs.get("use_direction_rule", True))
+    use_sampled_saturation_rule = bool(
+        ctx.mask_kwargs.get("use_sampled_saturation_rule", True)
+    )
+
+    r_high = 1.0 + eps_high
+    r_low = 1.0 + eps_low
+
+    # ----------------- Inputs -----------------------------------------
+    s2   = ctx.student_s2                          # (B, T)
+    pi_c = ctx.student_topk_probs                  # (B, T, K)
+    pi_a = ctx.student_log_prob_at_sampled.exp()   # (B, T)
+
+    teacher_ids   = ctx.teacher_topk_ids                       # (B, T, K)
+    teacher_probs = ctx.teacher_topk_logprobs.exp()            # (B, T, K)
+
+    sampled_ids  = ctx.student_sampled_ids.unsqueeze(-1)       # (B, T, 1)
+    sampled_at_c = teacher_ids == sampled_ids                  # (B, T, K)
+
+    # A(s,u) = log pi_T(u) - log pi_S(u).
+    # ctx.k1_per_token is stored as log pi_S(u) - log pi_T(u), so negate.
+    k1 = -ctx.k1_per_token                                     # (B, T)
+    k1_b = k1.unsqueeze(-1)                                    # (B, T, 1)
+
+    # ----------------- Teacher nucleus --------------------------------
     shifted_cumsum = torch.cat(
         [
             torch.zeros_like(teacher_probs[..., :1]),
@@ -517,38 +562,135 @@ def _mask_opd_drop_conflict(ctx: HybridMaskContext) -> MaskReturn:
         ],
         dim=-1,
     )
-    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K)
+    teacher_candidate = shifted_cumsum < teacher_top_p          # (B, T, K)
 
-    sampled_at_c = teacher_ids == ctx.student_sampled_ids.unsqueeze(-1)  # (B, T, K)
+    # ----------------- PG-induced direction at each c -----------------
+    # For c == u: sign(Delta pi(u)) = sign(A) = sign(k1).
+    # For c != u: sign(Delta pi(c)) = sign(A * (S2 - pi_S(u) - pi_S(c))).
+    bracket = s2.unsqueeze(-1) - pi_a.unsqueeze(-1) - pi_c
+    pg_dir_value = torch.where(sampled_at_c, k1_b, k1_b * bracket)
+    pg_raises_c = pg_dir_value >  adv_eps
+    pg_lowers_c = pg_dir_value < -adv_eps
 
-    # k1 = log pi_T(a) - log pi_S(a). ctx.k1_per_token is the negation.
-    k1_b = (-ctx.k1_per_token).unsqueeze(-1)  # (B, T, 1)
-    pi_a_b = pi_a.unsqueeze(-1)  # (B, T, 1)
-    s2_b = s2.unsqueeze(-1)  # (B, T, 1)
+    # ----------------- Ratios with numerical floor --------------------
+    pi_c_safe = pi_c.clamp_min(prob_floor)
+    pi_T_safe = teacher_probs.clamp_min(prob_floor)
 
-    # Signed proxy for Δpi(c), amplitude-aware (modulo positive learning-rate scalar).
-    # c == a:  Δpi(a) ∝ k1 · pi_a · (1 − 2·pi_a + S2)         — bracket always ≥ 0
-    # c != a:  Δpi(c) ∝ k1 · pi_c · (S2 − pi_a − pi_c)
-    bracket_at = 1.0 - 2.0 * pi_a_b + s2_b
-    bracket_off = s2_b - pi_a_b - pi_c
-    delta_pi_proxy = torch.where(
-        sampled_at_c,
-        k1_b * pi_a_b * bracket_at,
-        k1_b * pi_c * bracket_off,
-    )  # (B, T, K)
+    # ----------------- Per-candidate drop signals (M2, M3) ------------
+    low_student_coverage  = (pi_T_safe / pi_c_safe) > r_low                    # M3
 
-    # Per-candidate log-ratio. log pi_S at teacher candidates derived from pi_c.
-    log_pi_s_c = pi_c.clamp_min(1e-20).log()  # (B, T, K)
-    log_ratio = teacher_logp - log_pi_s_c  # (B, T, K)
+    want_increase_c = teacher_probs > pi_c
+    want_decrease_c = teacher_probs < pi_c
+    direction_conflict = (                                                      # M2
+        (want_increase_c & pg_lowers_c) | (want_decrease_c & pg_raises_c)
+    )
 
-    contrib = log_ratio * delta_pi_proxy  # (B, T, K)
-    contrib = contrib * teacher_candidate.float()  # restrict to nucleus
+    need_drop_per_c = torch.zeros_like(teacher_candidate)
+    if use_low_coverage_rule:
+        need_drop_per_c |= low_student_coverage
+    if use_direction_rule:
+        need_drop_per_c |= direction_conflict
+    need_drop_per_c &= teacher_candidate
 
-    score = contrib.sum(dim=-1)  # (B, T)
-    drop_pos = score < drop_threshold  # (B, T)
+    # ----------------- Mass-weighted position vote --------------------
+    drop_mass  = (teacher_probs * need_drop_per_c.float()).sum(dim=-1)         # (B, T)
+    total_mass = (teacher_probs * teacher_candidate.float()).sum(dim=-1).clamp_min(1e-8)
+    drop_vote  = drop_mass / total_mass                                        # (B, T)
+
+    drop_pos = drop_vote > drop_vote_threshold
+
+    # ----------------- Position-level sampled overshoot (M1) ----------
+    sampled_overshoot = torch.zeros_like(drop_pos)
+    if use_sampled_saturation_rule:
+        pi_T_at_a       = (teacher_probs * sampled_at_c.float()).sum(dim=-1)  # (B, T)
+        sampled_in_topk = sampled_at_c.any(dim=-1)
+        pi_a_safe       = pi_a.clamp_min(prob_floor)
+        pi_T_at_a_safe  = pi_T_at_a.clamp_min(prob_floor)
+        sampled_overshoot = (
+            sampled_in_topk
+            & ((pi_a_safe / pi_T_at_a_safe) > r_high)
+            & (pi_a > sampled_overshoot_floor)
+        )
+        drop_pos = drop_pos | sampled_overshoot
+
+    # ----------------- Advantage-percentile drop ----------------------
+    # Mirrors advantage_mask_percent in losses.py. Percentile is computed
+    # over the *origin* response mask globally across DP ranks (when
+    # initialized), so the cut points reflect the full token-advantage
+    # distribution rather than the M1/M2/M3-remaining subset.
+    adv_mask_percent = ctx.mask_kwargs.get("advantage_mask_percent", None)
+    adv_drop = None
+    if adv_mask_percent is not None:
+        # A(s,u) = log pi_T(u) - log pi_S(u); k1_per_token stores its negation.
+        adv = -ctx.k1_per_token  # (B, T)
+        response_bool = ctx.response_mask.bool()
+        valid_advs = adv[response_bool].float()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            local_size = torch.tensor([valid_advs.numel()], device=valid_advs.device)
+            all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+            torch.distributed.all_gather(all_sizes, local_size)
+            all_sizes = [int(s.item()) for s in all_sizes]
+
+            max_size = max(all_sizes) if all_sizes else 0
+            if max_size > 0:
+                padded = torch.nn.functional.pad(valid_advs, (0, max_size - valid_advs.numel()))
+                gathered = [
+                    torch.zeros(max_size, dtype=padded.dtype, device=padded.device)
+                    for _ in range(world_size)
+                ]
+                torch.distributed.all_gather(gathered, padded)
+                all_advs = torch.cat([t[:s] for t, s in zip(gathered, all_sizes, strict=False)])
+            else:
+                all_advs = valid_advs
+        else:
+            all_advs = valid_advs
+
+        if all_advs.numel() > 0:
+            tail = (1.0 - float(adv_mask_percent)) / 2.0  # e.g. 0.05 for 0.9
+            adv_low = torch.quantile(all_advs, tail).item()
+            adv_high = torch.quantile(all_advs, 1.0 - tail).item()
+            adv_drop = (adv >= adv_low) & (adv <= adv_high)
+            drop_pos = drop_pos | adv_drop
+            ctx.extras["opd_adv_mask_low"] = torch.tensor(adv_low, device=adv.device)
+            ctx.extras["opd_adv_mask_high"] = torch.tensor(adv_high, device=adv.device)
+
+    # ----------------- Student-EOS protection -------------------------
+    # Drop positions where the student sampled one of the listed EOS-like
+    # token ids. Use when student/teacher EOS vocab is misaligned (e.g.
+    # base→instruct) so PG would otherwise punish the student's EOS via
+    # an extreme negative A — see opd_drop_conflict design notes.
+    mask_eos_ids = ctx.mask_kwargs.get("mask_student_eos_token_ids", None)
+    eos_drop = None
+    if mask_eos_ids is not None:
+        if isinstance(mask_eos_ids, (int, float)):
+            mask_eos_ids = [int(mask_eos_ids)]
+        eos_drop = torch.zeros_like(drop_pos)
+        for eid in mask_eos_ids:
+            eos_drop = eos_drop | (ctx.student_sampled_ids == int(eid))
+        drop_pos = drop_pos | eos_drop
 
     pg_mask = ~drop_pos
     sup_mask = torch.zeros_like(pg_mask)
+
+    # ----------------- Diagnostics ------------------------------------
+    if use_direction_rule:
+        ctx.extras["opd_conflict_mask"] = (
+            direction_conflict & teacher_candidate
+        ).any(dim=-1)
+    if use_low_coverage_rule:
+        ctx.extras["opd_low_coverage_mask"] = (
+            low_student_coverage & teacher_candidate
+        ).any(dim=-1)
+    if use_sampled_saturation_rule:
+        ctx.extras["opd_sampled_overshoot_mask"] = sampled_overshoot
+    if adv_drop is not None:
+        ctx.extras["opd_adv_drop_mask"] = adv_drop
+    if eos_drop is not None:
+        ctx.extras["opd_eos_drop_mask"] = eos_drop
+    ctx.extras["opd_drop_vote"] = drop_vote
+
     return pg_mask, sup_mask
 
 

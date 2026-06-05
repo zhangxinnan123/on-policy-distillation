@@ -504,6 +504,11 @@ def compute_student_topk_overlap_k1(
             "coverage_scores": coverage_scores,
             "student_topk_probs": student_topk_probs,
             "student_s2": student_s2,
+            # log_Z exposed for the update_consistency callback: lets it
+            # recover Δlogit_u = Δlog π_u + Δlog_Z (unnormalized logit
+            # diagnostic). Not used by any loss term itself. Cast to fp32 so
+            # the callback's Δ measurement isn't bf16-quantized.
+            "student_log_Z": log_Z.squeeze(-1).to(torch.float32),  # (1, T)
         }
         outputs.update(
             _perj_overlap_diag(
