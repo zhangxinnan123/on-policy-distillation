@@ -1897,6 +1897,64 @@ class RayPPOTrainer:
                 hint_output.non_tensor_batch[k] = hint_input.non_tensor_batch[k]
         return hint_output
 
+    def _sdpo_is_correction_enabled(self) -> bool:
+        """True when strict-unbiased IS correction for merged hint rows is on
+        (sdpo.sdpo_grpo.is_correction.enabled). See _swap_hint_rows_to_unhinted."""
+        sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
+        if sdpo_cfg is None:
+            return False
+        grpo = sdpo_cfg.get("sdpo_grpo", None) if hasattr(sdpo_cfg, "get") else None
+        if grpo is None:
+            return False
+        isc = grpo.get("is_correction", None) if hasattr(grpo, "get") else None
+        return isc is not None and bool(isc.get("enabled", False))
+
+    def _swap_hint_rows_to_unhinted(self, batch: DataProto) -> DataProto:
+        """Strict-unbiased IS correction for merged hint rows (regime C).
+
+        Hint rows enter the merged batch with HINTED input_ids = [x, e, y_hint].
+        Their `old_log_probs` (computed earlier on those hinted ids) is therefore
+        the behavior logprob log π_θ(y_hint | x, e). For an UNBIASED policy
+        gradient on the deployment objective J(θ)=E_{y~π_θ(·|x)}[A], the score
+        function must be ∇log π_θ(y_hint | x) — i.e. the actor must forward the
+        UNHINTED prompt. This method swaps each hint row's prompt span back to the
+        un-hinted [x] (stashed as unhinted_prompt_ids by _concat_hint_into_main_batch),
+        leaving responses untouched.
+
+        Combined with actor.use_rollout_log_probs=True (so the actor uses the
+        stored old_log_probs instead of detaching), the PPO ratio for hint rows
+        becomes exp(log π_θ(y|x) − log π_old(y|x,e)) = π_θ(y|x)/π_old(y|x,e),
+        i.e. the IS weight — automatically bounded by the PPO clip. Main rows are
+        untouched (their unhinted_prompt_ids == prompts, ratio ≈ 1).
+        """
+        is_hint = batch.non_tensor_batch.get("is_hint_row", None)
+        if is_hint is None or "unhinted_prompt_ids" not in batch.batch:
+            return batch
+        is_hint_t = torch.as_tensor(np.asarray(is_hint, dtype=bool), device=batch.batch["prompts"].device)
+        if not bool(is_hint_t.any()):
+            return batch
+
+        from verl.utils.model import compute_position_id_with_mask
+
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attn = batch.batch["attention_mask"]
+        pl = prompts.shape[1]
+        unhinted_ids = batch.batch["unhinted_prompt_ids"]
+        unhinted_mask = batch.batch["unhinted_prompt_mask"]
+
+        sel = is_hint_t.unsqueeze(1)
+        new_prompts = torch.where(sel, unhinted_ids, prompts)
+        new_prompt_mask = torch.where(sel, unhinted_mask, attn[:, :pl])
+        new_input_ids = torch.cat([new_prompts, responses], dim=1)
+        new_attn = torch.cat([new_prompt_mask, attn[:, pl:]], dim=1)
+
+        batch.batch["prompts"] = new_prompts
+        batch.batch["input_ids"] = new_input_ids
+        batch.batch["attention_mask"] = new_attn
+        batch.batch["position_ids"] = compute_position_id_with_mask(new_attn)
+        return batch
+
     def _concat_hint_into_main_batch(
         self,
         batch: DataProto,
@@ -1919,6 +1977,30 @@ class RayPPOTrainer:
             n_hint: rollouts per hint prompt.
         """
         batch.non_tensor_batch["is_hint_row"] = np.zeros(len(batch), dtype=bool)
+
+        # Strict-unbiased IS correction: stash the UN-HINTED prompt span so the
+        # actor update can score hint responses under [x] (see
+        # _swap_hint_rows_to_unhinted). Main rows' unhinted prompt == their own
+        # prompt (never hinted). Hint rows borrow [x] from a same-uid main row
+        # (all rollouts of a uid share the same prompt). NOTE: source_batch is
+        # PRE-rollout and (in the agent-loop dataset path) carries no tokenized
+        # `prompts`, so we must read from the post-rollout main `batch` here.
+        # Gated so non-IS merge runs keep the old schema.
+        is_corr = self._sdpo_is_correction_enabled()
+        uid_to_xprompt: dict = {}
+        if is_corr:
+            pl_main = batch.batch["prompts"].shape[1]
+            batch.batch["unhinted_prompt_ids"] = batch.batch["prompts"].clone()
+            batch.batch["unhinted_prompt_mask"] = batch.batch["attention_mask"][:, :pl_main].clone()
+            main_uids = batch.non_tensor_batch.get("uid")
+            if main_uids is not None:
+                for i, u in enumerate(main_uids):
+                    if u not in uid_to_xprompt:
+                        uid_to_xprompt[u] = (
+                            batch.batch["unhinted_prompt_ids"][i],
+                            batch.batch["unhinted_prompt_mask"][i],
+                        )
+
         if hint_output is None or len(hint_output) == 0:
             return batch
 
@@ -1928,6 +2010,24 @@ class RayPPOTrainer:
         hint_batch = source_batch.repeat(repeat_times=n_hint, interleave=True)
         hint_batch = hint_batch.union(hint_output)
         hint_batch.non_tensor_batch["is_hint_row"] = np.ones(len(hint_batch), dtype=bool)
+        if is_corr and uid_to_xprompt:
+            # Per hint row, look up the un-hinted [x] prompt of its uid (from a
+            # main row). Same width (max_prompt_length) as the main half. If a uid
+            # is somehow missing (shouldn't happen), fall back to the hint row's
+            # own hinted prompt so the swap is a no-op there (IS weight = 1).
+            hint_uids = hint_batch.non_tensor_batch.get("uid")
+            pl_h = hint_batch.batch["prompts"].shape[1]
+            ids_rows, mask_rows = [], []
+            for j, u in enumerate(hint_uids):
+                if u in uid_to_xprompt:
+                    xi, xm = uid_to_xprompt[u]
+                else:
+                    xi = hint_batch.batch["prompts"][j]
+                    xm = hint_batch.batch["attention_mask"][j, :pl_h]
+                ids_rows.append(xi)
+                mask_rows.append(xm)
+            hint_batch.batch["unhinted_prompt_ids"] = torch.stack(ids_rows, dim=0)
+            hint_batch.batch["unhinted_prompt_mask"] = torch.stack(mask_rows, dim=0)
 
         # response_mask is added to the main batch between rollout and reward;
         # mirror that on the hint half so the concat is shape-consistent.
@@ -2747,6 +2847,22 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
+                        # Strict-unbiased IS correction: swap hint rows to their
+                        # un-hinted prompt so the actor's score function is
+                        # ∇log π_θ(y_hint|x). old_log_probs (stored, hinted) stays;
+                        # the PPO ratio then becomes the clipped IS weight. Requires
+                        # actor.use_rollout_log_probs=True (else the on-policy detach
+                        # overwrites old_log_probs and the IS weight collapses to 1).
+                        if self._sdpo_is_correction_enabled():
+                            if not bool(
+                                self.config.actor_rollout_ref.actor.get("use_rollout_log_probs", False)
+                            ):
+                                print(
+                                    "[sdpo.is_correction] WARNING: is_correction.enabled=True but "
+                                    "actor.use_rollout_log_probs=False — the on-policy detach will "
+                                    "zero out the IS weight (ratio≡1). Set use_rollout_log_probs=True."
+                                )
+                            batch = self._swap_hint_rows_to_unhinted(batch)
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
