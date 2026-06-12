@@ -33,7 +33,7 @@
 # verl/trainer/ppo/sdpo_ray_trainer.py (_swap_hint_rows_to_unhinted).
 set -xeuo pipefail
 source "$(dirname "$0")/../config.sh"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+# export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 
 ############################ Quick Config ############################
 ROLLOUT_NAME="vllm"
