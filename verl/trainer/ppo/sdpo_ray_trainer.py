@@ -1955,6 +1955,63 @@ class RayPPOTrainer:
         batch.batch["position_ids"] = compute_position_id_with_mask(new_attn)
         return batch
 
+    def _sdpo_is_fn_const(self) -> float:
+        """IS-weight squashing constant c for f(w)=w/(w+c) (regime-C hint rows).
+
+        c<=0 → implicit-ratio mode (IS weight lives in the PPO ratio, strict
+        unbiased, see _swap_hint_rows_to_unhinted). c>0 → explicit mode: the IS
+        weight is computed in the trainer, squashed by f(w)=w/(w+c), and applied
+        as rollout_is_weights. Read from sdpo.sdpo_grpo.is_correction.fn_const."""
+        sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
+        if sdpo_cfg is None:
+            return 0.0
+        grpo = sdpo_cfg.get("sdpo_grpo", None) if hasattr(sdpo_cfg, "get") else None
+        if grpo is None:
+            return 0.0
+        isc = grpo.get("is_correction", None) if hasattr(grpo, "get") else None
+        if isc is None:
+            return 0.0
+        return float(isc.get("fn_const", 0.0))
+
+    def _build_is_rollout_weights(
+        self,
+        batch: DataProto,
+        unhinted_logprob: torch.Tensor,
+        hinted_logprob: torch.Tensor,
+        c: float,
+    ) -> tuple[DataProto, dict]:
+        """Explicit IS weighting for merged hint rows via f(w)=w/(w+c).
+
+        w_t = π_θ(y_t|x)/π_θ(y_t|x,e) = exp(unhinted_logprob - hinted_logprob).
+        f(w) squashes it: tiny weights (stuck prompts) get lifted, large weights
+        saturate at 1. Written to batch["rollout_is_weights"] (1.0 on main rows),
+        which compute_policy_loss_vanilla multiplies into the per-token pg_loss.
+        Requires a NEUTRAL PPO ratio (use_rollout_log_probs=False, on-policy) so
+        the effective coefficient is exactly f(w), not f(w)·ratio.
+        """
+        is_hint = batch.non_tensor_batch.get("is_hint_row", None)
+        response_mask = batch.batch["response_mask"]
+        w = torch.exp(torch.clamp(unhinted_logprob - hinted_logprob, min=-20.0, max=20.0))
+        fw = w / (w + c)
+        if is_hint is None:
+            weights = torch.ones_like(fw)
+        else:
+            is_hint_t = torch.as_tensor(
+                np.asarray(is_hint, dtype=bool), device=fw.device
+            ).unsqueeze(1)
+            weights = torch.where(is_hint_t, fw, torch.ones_like(fw))
+        batch.batch["rollout_is_weights"] = weights
+
+        metrics: dict = {}
+        if is_hint is not None:
+            hint_resp = is_hint_t & response_mask.bool()
+            if bool(hint_resp.any()):
+                metrics["sdpo/is/mean_weight"] = float(w[hint_resp].mean())
+                metrics["sdpo/is/mean_fw"] = float(fw[hint_resp].mean())
+                metrics["sdpo/is/min_weight"] = float(w[hint_resp].min())
+                metrics["sdpo/is/max_weight"] = float(w[hint_resp].max())
+        return batch, metrics
+
     def _concat_hint_into_main_batch(
         self,
         batch: DataProto,
@@ -2847,22 +2904,44 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
-                        # Strict-unbiased IS correction: swap hint rows to their
-                        # un-hinted prompt so the actor's score function is
-                        # ∇log π_θ(y_hint|x). old_log_probs (stored, hinted) stays;
-                        # the PPO ratio then becomes the clipped IS weight. Requires
-                        # actor.use_rollout_log_probs=True (else the on-policy detach
-                        # overwrites old_log_probs and the IS weight collapses to 1).
+                        # IS correction for merged hint rows. The score function must
+                        # be ∇log π_θ(y_hint|x), so always swap hint rows to their
+                        # un-hinted prompt first. Two weighting modes:
                         if self._sdpo_is_correction_enabled():
-                            if not bool(
+                            fn_const = self._sdpo_is_fn_const()
+                            use_rlp = bool(
                                 self.config.actor_rollout_ref.actor.get("use_rollout_log_probs", False)
-                            ):
-                                print(
-                                    "[sdpo.is_correction] WARNING: is_correction.enabled=True but "
-                                    "actor.use_rollout_log_probs=False — the on-policy detach will "
-                                    "zero out the IS weight (ratio≡1). Set use_rollout_log_probs=True."
+                            )
+                            if fn_const > 0.0:
+                                # Explicit mode: f(w)=w/(w+c) applied as rollout_is_weights.
+                                # Needs a NEUTRAL ratio (use_rollout_log_probs=False, on-policy)
+                                # so the coefficient is exactly f(w). Compute w from a forward
+                                # on the swapped (un-hinted) batch vs the stored hinted old.
+                                if use_rlp:
+                                    print(
+                                        "[sdpo.is_correction] WARNING: fn_const>0 (explicit f(w)) "
+                                        "but use_rollout_log_probs=True — ratio would double-count w. "
+                                        "Set use_rollout_log_probs=False for explicit mode."
+                                    )
+                                hinted_old = batch.batch["old_log_probs"].clone()
+                                batch = self._swap_hint_rows_to_unhinted(batch)
+                                unhinted_dp, _ = self._compute_old_log_prob(batch)
+                                unhinted = unhinted_dp.batch["old_log_probs"]
+                                batch, is_metrics = self._build_is_rollout_weights(
+                                    batch, unhinted, hinted_old, fn_const
                                 )
-                            batch = self._swap_hint_rows_to_unhinted(batch)
+                                metrics.update(is_metrics)
+                            else:
+                                # Implicit mode: strict-unbiased, IS weight = PPO ratio.
+                                # Requires use_rollout_log_probs=True (else on-policy detach
+                                # collapses the ratio to 1 and the IS weight vanishes).
+                                if not use_rlp:
+                                    print(
+                                        "[sdpo.is_correction] WARNING: implicit IS mode but "
+                                        "use_rollout_log_probs=False — ratio≡1, IS weight lost. "
+                                        "Set use_rollout_log_probs=True or fn_const>0."
+                                    )
+                                batch = self._swap_hint_rows_to_unhinted(batch)
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
