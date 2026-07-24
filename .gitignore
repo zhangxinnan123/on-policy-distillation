@@ -7,6 +7,10 @@
 **/*.tar.gz
 **/playground
 **/wandb
+data/
+sdpo_experiment/hint_llm/logs/
+*.parquet
+*.jsonl
 
 /pyrightconfig.json
 

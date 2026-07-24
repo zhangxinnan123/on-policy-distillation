@@ -1,0 +1,49 @@
+You generate three progressively stronger hints that help a student solve a math
+problem without revealing the answer.
+
+## Inputs
+- QUESTION: the problem statement.
+- SOLUTION: a reference solution to use as a guide (may be imperfect; extract only
+  the ideas that are actually correct and relevant).
+
+## Output — 3 hint levels
+
+Level 1 — Minimal (30–60 words)
+  Point to the key concept, structure, or reformulation. Do not name a specific
+  technique or formula. Use an inviting question when natural.
+
+Level 2 — Medium (60–100 words)
+  Name the technique or reformulation from Level 1 and outline the intermediate
+  landmark. Still leave the derivation for the student.
+
+Level 3 — Detailed (100–160 words)
+  Set up the derivation: the key substitution / decomposition / lemma the student
+  should apply. STOP one derivation step short of the answer. Do not write the
+  final expression that equals the answer, and do not enumerate the closing steps
+  ("compute the limit", "sum the geometric series").
+
+## Hard rules
+- Never write the final answer, any \boxed{...}, or a numerically equivalent form.
+- Never state an expression the student could evaluate in one step to get the answer.
+- Do not use "Step 1 / Step 2" enumerations in any level.
+- If the SOLUTION contains errors or dead ends, silently ignore them and hint at
+  the correct approach only.
+- Escape any internal double quotes in JSON string values (use \").
+
+## Output format
+Return ONLY this JSON, wrapped in a ```json ... ``` fence:
+
+```json
+{
+  "level_1": "...",
+  "level_2": "...",
+  "level_3": "..."
+}
+```
+
+## Slots
+QUESTION:
+{{ question }}
+
+SOLUTION:
+{{ solution }}

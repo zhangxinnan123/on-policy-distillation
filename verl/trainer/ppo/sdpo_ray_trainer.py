@@ -77,10 +77,14 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 # Ends with the \boxed{} format instruction so the model still knows the answer
 # format even after `strip_suffix` removes the dataset's original suffix.
 # `{{}}` escapes the literal `{}` inside .format()'s substitution machinery.
+# Direct-hint template: for short LLM-extracted hints (e.g. level_3 ~80 words).
+# No "don't quote / paraphrase" clause — a short hint has no verbatim content
+# worth copying, and forbidding paraphrase would suppress use of key terms the
+# hint deliberately names (e.g. "partial fraction", "telescoping"). Frames the
+# hint as a suggested direction rather than a full trajectory to distill from.
 EXPERT_GUIDANCE_TEMPLATE = (
-    "\n\nYou may use the expert trajectory only as *private guidance* to check your own reasoning.\n"
-    "Do NOT quote, copy, paraphrase, or explicitly reference any sentence from it.\n"
-    "Expert trajectory:{expert}\n"
+    "\n\nHint (a suggested approach — use it to guide your reasoning, but derive every step yourself):"
+    "{expert}\n"
     "Please reason step by step, and put your final answer within \\boxed{{}}."
 )
 
@@ -105,6 +109,9 @@ def compute_sdpo_grpo_advantage(
     sign_flip_lambda_pos: float = 0.5,
     sign_flip_lambda_neg: float = 0.0,
     sign_flip_epsilon: float = 0.2,
+    regime_c_scale: float = 1.0,
+    always_merge_hint_into_group: bool = False,
+    regime_c_zero_hint_adv: bool = False,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SDPO + GRPO advantage with per-uid regime selection.
@@ -164,6 +171,7 @@ def compute_sdpo_grpo_advantage(
 
         scores_cpu = scores.detach().cpu().numpy()
         n_regA = n_regB = n_regC = 0  # for diagnostics
+        regC_hint_rows_all: list = []  # accumulate all Regime C hint row indices
 
         all_uids = set(list(uid_main.keys()) + list(uid_hint.keys()))
         for uid in all_uids:
@@ -176,8 +184,15 @@ def compute_sdpo_grpo_advantage(
             any_main_succ = bool((main_scores > 0).any()) if main_scores.size else False
             all_main_fail = (not any_main_succ) and (main_scores.size > 0)
 
+            # Choose the GRPO group: main only, or main+hint (always).
+            #   `always_merge_hint_into_group=True` → hint rows always in group
+            #   EXCEPT in Regime A (hint failed): failed hint would pollute the
+            #   group statistics without carrying useful gradient signal, so
+            #   we skip it. Hint row keeps advantage=0 in Regime A.
+
             if not any_hint_succ:
-                # Regime A: vanilla GRPO on main only; hint rows stay at 0.
+                # Regime A: hint failed. Skip hint rows entirely (regardless of
+                # always_merge_hint_into_group); hint stays at 0 advantage.
                 n_regA += 1
                 _fill_grpo_advantages(
                     advantages=advantages,
@@ -188,24 +203,42 @@ def compute_sdpo_grpo_advantage(
                     epsilon=epsilon,
                 )
             elif all_main_fail:
-                # Regime C: GRPO with main+hint group; both halves get gradient.
+                # Regime C: student stuck, hint succeeds.
+                # Skip GRPO normalization here. Set advantage per raw score:
+                #   hint (succ, score=1) → A = +1  (positive learning signal)
+                #   main (fail, score=0) → A =  0  (no gradient, no punishment)
+                # Motivation: main-all-fail means "student doesn't know how", not
+                # "student did something wrong". Punishing failures under GRPO
+                # zero-sum in Regime C creates spurious negative gradient (~-0.09
+                # after α=0.25) that has no clear signal. Instead we use hint as
+                # the sole positive example. Downstream amplify (if enabled)
+                # will further shape the hint row's per-token gradient.
+                # NOTE: regime_c_scale still multiplies the +1 (defaults 1.0
+                # under this branch — no further dampening needed).
                 n_regC += 1
-                _fill_grpo_advantages(
-                    advantages=advantages,
-                    scores=scores,
-                    response_mask=response_mask,
-                    row_idx=main_rows + hint_rows,
-                    norm_by_std=norm_adv_by_std_in_grpo,
-                    epsilon=epsilon,
-                )
+                # Broadcast per-row scalar to per-token via response_mask.
+                # `regime_c_zero_hint_adv=True` sets hint A=0 too, delegating
+                # hint gradient signal to hint_reg auxiliary loss (avoids double-
+                # counting when hint_reg is enabled).
+                if not regime_c_zero_hint_adv:
+                    for i in hint_rows:
+                        advantages[i] = regime_c_scale * response_mask[i]  # A=regime_c_scale on valid tokens
+                # main_rows remain zero (initial `advantages = torch.zeros_like`).
+                # Track Regime C hint rows so trainer can build hint_reg_mask
+                # regardless of whether hint advantage was zeroed out.
+                regC_hint_rows_all.extend(hint_rows)
             else:
-                # Regime B: SDPO sign-flip on main rows; hint rows stay at 0.
+                # Regime B: main has both successes and failures + hint succeeded.
+                # If always_merge is ON, hint (which succeeded) joins the GRPO
+                # group; otherwise only main rows normalized. Sign-flip still
+                # reweights only main rows (its formula is defined for main).
                 n_regB += 1
+                rb_rows = (main_rows + hint_rows) if always_merge_hint_into_group else main_rows
                 _fill_grpo_advantages(
                     advantages=advantages,
                     scores=scores,
                     response_mask=response_mask,
-                    row_idx=main_rows,
+                    row_idx=rb_rows,
                     norm_by_std=norm_adv_by_std_in_grpo,
                     epsilon=epsilon,
                 )
@@ -224,12 +257,13 @@ def compute_sdpo_grpo_advantage(
 
         # Stash per-step regime counts in a module-global so the trainer can pull
         # them into the metrics dict. (Function signature is locked.)
-        global _LAST_SDPO_REGIME_COUNTS
+        global _LAST_SDPO_REGIME_COUNTS, _LAST_SDPO_REGC_HINT_ROWS
         _LAST_SDPO_REGIME_COUNTS = {
             "regA_hint_fail": n_regA,
             "regB_sign_flip": n_regB,
             "regC_stuck_student": n_regC,
         }
+        _LAST_SDPO_REGC_HINT_ROWS = regC_hint_rows_all
 
     return advantages, advantages
 
@@ -237,6 +271,9 @@ def compute_sdpo_grpo_advantage(
 # Filled in by `compute_sdpo_grpo_advantage`; the trainer reads this immediately
 # after the call to surface per-step regime counts as wandb metrics.
 _LAST_SDPO_REGIME_COUNTS: dict = {}
+# List of row indices that belong to Regime C hint rows in the last
+# compute_sdpo_grpo_advantage call. Read by the trainer to build hint_reg_mask.
+_LAST_SDPO_REGC_HINT_ROWS: list = []
 
 
 def sign_flip_decay_multiplier(
@@ -591,6 +628,9 @@ def compute_advantage(
             sign_flip_lambda_pos=float(sdpo_cfg.get("sign_flip_lambda_pos", 0.5)),
             sign_flip_lambda_neg=float(sdpo_cfg.get("sign_flip_lambda_neg", 0.0)),
             sign_flip_epsilon=float(sdpo_cfg.get("sign_flip_epsilon", 0.2)),
+            regime_c_scale=float(sdpo_cfg.get("regime_c_scale", 1.0)),
+            always_merge_hint_into_group=bool(sdpo_cfg.get("always_merge_hint_into_group", False)),
+            regime_c_zero_hint_adv=bool(sdpo_cfg.get("regime_c_zero_hint_adv", False)),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -1956,12 +1996,13 @@ class RayPPOTrainer:
         return batch
 
     def _sdpo_is_fn_const(self) -> float:
-        """IS-weight squashing constant c for f(w)=w/(w+c) (regime-C hint rows).
+        """LUFFY reshape constant c for f(w)=w/(w+c) on merged hint rows.
 
-        c<=0 → implicit-ratio mode (IS weight lives in the PPO ratio, strict
-        unbiased, see _swap_hint_rows_to_unhinted). c>0 → explicit mode: the IS
-        weight is computed in the trainer, squashed by f(w)=w/(w+c), and applied
-        as rollout_is_weights. Read from sdpo.sdpo_grpo.is_correction.fn_const."""
+        c<=0 → implicit-ratio mode: IS weight lives in the PPO ratio; strict
+        unbiased when use_rollout_log_probs=True (see _swap_hint_rows_to_unhinted).
+        c>0 → explicit mode: hint-row weight computed in the trainer, applied
+        as rollout_is_weights. Requires use_rollout_log_probs=False. Read from
+        sdpo.sdpo_grpo.is_correction.fn_const."""
         sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
         if sdpo_cfg is None:
             return 0.0
@@ -1973,43 +2014,178 @@ class RayPPOTrainer:
             return 0.0
         return float(isc.get("fn_const", 0.0))
 
+    def _sdpo_is_correction_params(self) -> tuple[str, float, float, float]:
+        """Returns (mode, clip_low, clip_high, gamma) for the explicit IS-weight mode.
+
+        mode: 'shaping' (default, LUFFY f(w)=w/(w+c)), 'clip' (PPO-style hard
+              clip on IS ratio), or 'amplify' (LUFFY gradient modifier
+              4γ²/(p+γ)² applied to positive-advantage hint tokens).
+              Config: sdpo.sdpo_grpo.is_correction.mode.
+        clip_low/high: bounds for mode='clip'. Config:
+              sdpo.sdpo_grpo.is_correction.clip_low / .clip_high.
+        gamma: inflection point for mode='amplify'. Config:
+              sdpo.sdpo_grpo.is_correction.gamma.
+        """
+        sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
+        if sdpo_cfg is None:
+            return "shaping", 0.8, 1.28, 0.1
+        grpo = sdpo_cfg.get("sdpo_grpo", None) if hasattr(sdpo_cfg, "get") else None
+        if grpo is None:
+            return "shaping", 0.8, 1.28, 0.1
+        isc = grpo.get("is_correction", None) if hasattr(grpo, "get") else None
+        if isc is None:
+            return "shaping", 0.8, 1.28, 0.1
+        mode = str(isc.get("mode", "shaping"))
+        clip_low = float(isc.get("clip_low", 0.8))
+        clip_high = float(isc.get("clip_high", 1.28))
+        gamma = float(isc.get("gamma", 0.1))
+        return mode, clip_low, clip_high, gamma
+
     def _build_is_rollout_weights(
         self,
         batch: DataProto,
         unhinted_logprob: torch.Tensor,
         hinted_logprob: torch.Tensor,
         c: float,
+        mode: str = "shaping",
+        clip_low: float = 0.8,
+        clip_high: float = 1.28,
+        gamma: float = 0.1,
     ) -> tuple[DataProto, dict]:
-        """Explicit IS weighting for merged hint rows via f(w)=w/(w+c).
+        """Off-policy correction weight for merged hint rows.
 
-        w_t = π_θ(y_t|x)/π_θ(y_t|x,e) = exp(unhinted_logprob - hinted_logprob).
-        f(w) squashes it: tiny weights (stuck prompts) get lifted, large weights
-        saturate at 1. Written to batch["rollout_is_weights"] (1.0 on main rows),
-        which compute_policy_loss_vanilla multiplies into the per-token pg_loss.
-        Requires a NEUTRAL PPO ratio (use_rollout_log_probs=False, on-policy) so
-        the effective coefficient is exactly f(w), not f(w)·ratio.
+        We form the true per-token IS ratio (LUFFY paper only has the
+        numerator; we have both because we sampled the hint rollouts ourselves):
+
+            w_t = π_θ(y_t|x) / π_θ(y_t|x, e)
+                = exp(unhinted_logprob - hinted_logprob)
+
+        Then apply one of two per-token weightings, chosen by `mode`:
+
+          mode="shaping" (LUFFY-style, default):
+              f(w) = w / (w + c)
+              Smooth bounded in [0, 1). Tiny w lifted to ~w/c, huge w
+              saturates at 1. Config: `+sdpo.sdpo_grpo.is_correction.fn_const=c`.
+
+          mode="clip" (PPO-style hard clip on the IS ratio, DAPO defaults):
+              g(w) = clip(w, clip_low, clip_high)
+              Defaults [0.8, 1.28] follow DAPO's asymmetric PPO clip
+              (1-ε, 1+ε_high). Aggressive: any hint token whose IS ratio drops
+              below 0.8 is snapped up to 0.8, so most hint gradient survives at
+              near-full magnitude. Any explosion above 1.28 is capped.
+              Config: `+sdpo.sdpo_grpo.is_correction.mode=clip
+                       +sdpo.sdpo_grpo.is_correction.clip_low=0.8
+                       +sdpo.sdpo_grpo.is_correction.clip_high=1.28`.
+
+          mode="amplify" (LUFFY-style gradient modifier for rare-token boost):
+              g(p) = 4·γ² / (p + γ)²    where p = π_θ(y|x)
+              Multiplies the PPO-clipped surrogate loss to amplify rare
+              (low-p) tokens and suppress common (high-p) ones. The multiplier
+              is 1.0 at p=γ (inflection), > 1 for p<γ (boost), and → 0 for
+              p >> γ. Applied ONLY on hint rows with positive advantage
+              (i.e. the "guided token learning" case). Other tokens keep
+              weight = 1.0 (standard PPO update).
+              Config: `+sdpo.sdpo_grpo.is_correction.mode=amplify
+                       +sdpo.sdpo_grpo.is_correction.gamma=0.1`.
+              NOTE: this mode is compatible with `use_rollout_log_probs=True`;
+              the amplifier multiplies onto the clipped PPO surrogate rather
+              than replacing the ratio, so PPO's min-clip semantics remain.
+
+        Written to batch["rollout_is_weights"] (1.0 on main rows), which
+        compute_policy_loss_vanilla multiplies into the per-token pg_loss.
+
+        For "shaping" and "clip" modes, requires a NEUTRAL PPO ratio
+        (use_rollout_log_probs=False, on-policy) so the effective coefficient
+        is exactly the returned weight (not weight·ratio).
+        For "amplify" mode, PPO clip via `use_rollout_log_probs=True` is
+        REQUIRED so the amplifier multiplies onto the true PPO clipped surrogate.
         """
         is_hint = batch.non_tensor_batch.get("is_hint_row", None)
         response_mask = batch.batch["response_mask"]
-        w = torch.exp(torch.clamp(unhinted_logprob - hinted_logprob, min=-20.0, max=20.0))
-        fw = w / (w + c)
+        # Clamp the log-ratio for numerical safety: exp(diff) can overflow if
+        # the two forwards disagree massively (rare, but happens on padding /
+        # early-dead tokens). No clamp on the individual logprobs themselves.
+        w = torch.exp(torch.clamp(unhinted_logprob - hinted_logprob, min=-10.0, max=10.0))
+
+        if mode == "shaping":
+            shaped = w / (w + c)
+        elif mode == "clip":
+            shaped = torch.clamp(w, min=clip_low, max=clip_high)
+        elif mode == "amplify":
+            # p = π_θ(y|x) — raw deployment-distribution probability per hint token.
+            # gradient_modifier = 4γ² / (p + γ)²    — 1.0 at p=γ, boosts p<γ, damps p>>γ.
+            # Only apply to hint rows with positive advantage (guided learning);
+            # other tokens stay at 1.0 (standard PPO). advantage>0 filter is done
+            # below in the where(...) combining with is_hint_t.
+            p = torch.exp(unhinted_logprob)
+            shaped = (4.0 * (gamma ** 2)) / (p + gamma).square()
+        elif mode == "amplify_linear":
+            # Ablation on 'amplify': drop the square in the denominator.
+            # gradient_modifier = 2γ / (p + γ)     — still 1.0 at p=γ, but softer
+            # amplification on rare tokens and softer suppression on common ones.
+            #   p=0.001 → 1.98   (vs 3.31 for amplify)
+            #   p=0.1   → 1.00   (inflection)
+            #   p=0.5   → 0.33   (vs 0.11 for amplify)
+            # Same advantage-sign gating as 'amplify' (only hint & adv>0).
+            p = torch.exp(unhinted_logprob)
+            shaped = (2.0 * gamma) / (p + gamma)
+        else:
+            raise ValueError(
+                f"unknown is_correction mode={mode!r}, expected "
+                f"'shaping' or 'clip' or 'amplify' or 'amplify_linear'"
+            )
+
         if is_hint is None:
-            weights = torch.ones_like(fw)
+            weights = torch.ones_like(shaped)
         else:
             is_hint_t = torch.as_tensor(
-                np.asarray(is_hint, dtype=bool), device=fw.device
+                np.asarray(is_hint, dtype=bool), device=shaped.device
             ).unsqueeze(1)
-            weights = torch.where(is_hint_t, fw, torch.ones_like(fw))
+            if mode in ("amplify", "amplify_linear"):
+                # Extra filter: only positive-advantage hint tokens get amplified.
+                # Others (negative-adv hint, or all main rows) keep weight=1.
+                adv = batch.batch.get("advantages", None)
+                if adv is None:
+                    raise RuntimeError(
+                        f"mode={mode!r} requires advantages in batch; "
+                        "compute_advantage must have run before _build_is_rollout_weights."
+                    )
+                # adv is per-token but broadcast from per-row (GRPO); take sign.
+                pos_adv_t = adv > 0
+                apply_mask = is_hint_t & pos_adv_t
+                weights = torch.where(apply_mask, shaped, torch.ones_like(shaped))
+            else:
+                weights = torch.where(is_hint_t, shaped, torch.ones_like(shaped))
         batch.batch["rollout_is_weights"] = weights
 
         metrics: dict = {}
         if is_hint is not None:
             hint_resp = is_hint_t & response_mask.bool()
             if bool(hint_resp.any()):
-                metrics["sdpo/is/mean_weight"] = float(w[hint_resp].mean())
-                metrics["sdpo/is/mean_fw"] = float(fw[hint_resp].mean())
-                metrics["sdpo/is/min_weight"] = float(w[hint_resp].min())
-                metrics["sdpo/is/max_weight"] = float(w[hint_resp].max())
+                metrics["sdpo/is/mean_w"] = float(w[hint_resp].mean())
+                metrics["sdpo/is/mean_shaped"] = float(shaped[hint_resp].mean())
+                metrics["sdpo/is/min_w"] = float(w[hint_resp].min())
+                metrics["sdpo/is/max_w"] = float(w[hint_resp].max())
+                if mode in ("amplify", "amplify_linear"):
+                    # Distribution of the amplifier on hint tokens with positive advantage.
+                    apply_tok = apply_mask.expand_as(shaped) & response_mask.bool()
+                    if bool(apply_tok.any()):
+                        amp_hint = shaped[apply_tok]
+                        metrics["sdpo/is/amp_mean"] = float(amp_hint.mean())
+                        metrics["sdpo/is/amp_max"] = float(amp_hint.max())
+                        metrics["sdpo/is/amp_min"] = float(amp_hint.min())
+                        # Fraction of amplified tokens (amp>1 = boost, amp<1 = damp)
+                        metrics["sdpo/is/amp_boost_frac"] = float((amp_hint > 1.0).float().mean())
+                if mode == "clip":
+                    # Fraction of hint tokens hitting each clip bound.
+                    hint_tok = is_hint_t.expand_as(w) & response_mask.bool()
+                    denom = float(max(1.0, hint_tok.sum().item()))
+                    metrics["sdpo/is/clip_low_frac"] = float(
+                        ((w < clip_low) & hint_tok).sum().item() / denom
+                    )
+                    metrics["sdpo/is/clip_high_frac"] = float(
+                        ((w > clip_high) & hint_tok).sum().item() / denom
+                    )
         return batch, metrics
 
     def _concat_hint_into_main_batch(
@@ -2384,6 +2560,20 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+
+        # SDPO hint_reg: pass config via meta_info (not FSDPActorConfig dataclass,
+        # which rejects unknown fields). dp_actor reads batch.meta_info["hint_reg"].
+        sdpo_cfg = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
+        hint_reg_cfg = sdpo_cfg.get("hint_reg", None) if sdpo_cfg is not None and hasattr(sdpo_cfg, "get") else None
+        if hint_reg_cfg is not None:
+            # Serialize to plain dict for Ray transport.
+            batch.meta_info["hint_reg"] = {
+                "enabled": bool(hint_reg_cfg.get("enabled", False)),
+                "gamma": float(hint_reg_cfg.get("gamma", 0.1)),
+                "clip_eps": float(hint_reg_cfg.get("clip_eps", 0.2)),
+                "coef": float(hint_reg_cfg.get("coef", 1.0)),
+                "input_type": str(hint_reg_cfg.get("input_type", "ratio")),
+            }
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -2909,26 +3099,55 @@ class RayPPOTrainer:
                         # un-hinted prompt first. Two weighting modes:
                         if self._sdpo_is_correction_enabled():
                             fn_const = self._sdpo_is_fn_const()
+                            is_mode, clip_low, clip_high, gamma_amp = self._sdpo_is_correction_params()
                             use_rlp = bool(
                                 self.config.actor_rollout_ref.actor.get("use_rollout_log_probs", False)
                             )
-                            if fn_const > 0.0:
-                                # Explicit mode: f(w)=w/(w+c) applied as rollout_is_weights.
-                                # Needs a NEUTRAL ratio (use_rollout_log_probs=False, on-policy)
-                                # so the coefficient is exactly f(w). Compute w from a forward
-                                # on the swapped (un-hinted) batch vs the stored hinted old.
-                                if use_rlp:
+                            # Explicit mode activates on fn_const>0 (shaping),
+                            # mode='clip' (bounded IS), or mode='amplify' /
+                            # 'amplify_linear' (LUFFY grad modifier variants).
+                            explicit_mode = (
+                                fn_const > 0.0
+                                or is_mode == "clip"
+                                or is_mode in ("amplify", "amplify_linear")
+                            )
+                            if explicit_mode:
+                                # Explicit IS weight on hint rows using our own hinted
+                                # rollout logprob (which LUFFY paper lacks):
+                                #     w = π_θ(y|x) / π_θ(y|x, e)
+                                # Then either shaping f(w)=w/(w+c), clip(w, low, high),
+                                # or amplify (4γ²/(p+γ)²) — see _build_is_rollout_weights.
+                                #
+                                # NOTE on use_rollout_log_probs:
+                                #  - shaping/clip: require it OFF (NEUTRAL PPO ratio)
+                                #  - amplify: requires it ON (multiplies onto PPO clipped surrogate)
+                                if is_mode in ("amplify", "amplify_linear"):
+                                    if not use_rlp:
+                                        print(
+                                            f"[sdpo.is_correction] WARNING: mode={is_mode!r} but "
+                                            "use_rollout_log_probs=False — PPO ratio collapses to 1, "
+                                            "amplifier will multiply only base advantage. Set "
+                                            "use_rollout_log_probs=True."
+                                        )
+                                elif use_rlp:
                                     print(
-                                        "[sdpo.is_correction] WARNING: fn_const>0 (explicit f(w)) "
-                                        "but use_rollout_log_probs=True — ratio would double-count w. "
-                                        "Set use_rollout_log_probs=False for explicit mode."
+                                        "[sdpo.is_correction] WARNING: explicit IS mode "
+                                        f"(mode={is_mode}, fn_const={fn_const}) but "
+                                        "use_rollout_log_probs=True — ratio would double-count. "
+                                        "Set use_rollout_log_probs=False for shaping/clip."
                                     )
+                                # Grab hinted logprob BEFORE swap (batch["old_log_probs"]
+                                # was populated by _compute_old_log_prob earlier this step
+                                # on the hinted prompts x+e; for hint rows this is
+                                # log π_θ(y_hint|x,e)).
                                 hinted_old = batch.batch["old_log_probs"].clone()
                                 batch = self._swap_hint_rows_to_unhinted(batch)
                                 unhinted_dp, _ = self._compute_old_log_prob(batch)
                                 unhinted = unhinted_dp.batch["old_log_probs"]
                                 batch, is_metrics = self._build_is_rollout_weights(
-                                    batch, unhinted, hinted_old, fn_const
+                                    batch, unhinted, hinted_old, fn_const,
+                                    mode=is_mode, clip_low=clip_low, clip_high=clip_high,
+                                    gamma=gamma_amp,
                                 )
                                 metrics.update(is_metrics)
                             else:
@@ -2942,6 +3161,22 @@ class RayPPOTrainer:
                                         "Set use_rollout_log_probs=True or fn_const>0."
                                     )
                                 batch = self._swap_hint_rows_to_unhinted(batch)
+
+                        # SDPO hint_reg auxiliary loss mask: precompute the
+                        # per-token mask over Regime C hint rows only, using
+                        # the row indices exposed by compute_sdpo_grpo_advantage.
+                        # Works even when regime_c_zero_hint_adv=True (advantage=0
+                        # would otherwise erase the "hint & adv>0" heuristic).
+                        sdpo_cfg_ref = self.config.get("sdpo", None) if hasattr(self.config, "get") else None
+                        hint_reg_cfg = sdpo_cfg_ref.get("hint_reg", None) if sdpo_cfg_ref is not None and hasattr(sdpo_cfg_ref, "get") else None
+                        if hint_reg_cfg is not None and bool(hint_reg_cfg.get("enabled", False)):
+                            rc_hint_rows = list(_LAST_SDPO_REGC_HINT_ROWS)
+                            resp_mask = batch.batch.get("response_mask", None)
+                            if resp_mask is not None:
+                                hint_reg_mask = torch.zeros_like(resp_mask, dtype=torch.bool)
+                                if rc_hint_rows:
+                                    hint_reg_mask[rc_hint_rows] = resp_mask[rc_hint_rows].bool()
+                                batch.batch["hint_reg_mask"] = hint_reg_mask
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)

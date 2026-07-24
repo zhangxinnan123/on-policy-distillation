@@ -534,6 +534,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        # SDPO hint_reg auxiliary loss: mask over Regime C hint tokens with positive
+        # advantage. Precomputed in trainer before _update_actor.
+        if "hint_reg_mask" in data.batch.keys():
+            select_keys.append("hint_reg_mask")
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
@@ -644,6 +648,62 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
+
+                    # SDPO hint_reg auxiliary loss: LUFFY-style objective on
+                    # Regime C hint tokens only (mask precomputed in trainer as
+                    # `hint_reg_mask`). Formula:
+                    #     ratio = π_θ(y|x) / π_θ_start(y|x, e)
+                    #             = exp(log_prob - old_log_prob.detach())
+                    #     ratio_capped = min(ratio, 1 + clip_eps)  (A_hint=+1>0 → upper only)
+                    #     objective = ratio_capped / (ratio_capped + γ)
+                    #     loss_hint_reg = -mean(objective over hint_reg_mask)
+                    # Gradient FLOWS through ratio_capped → log_prob → θ, so it's
+                    # the true `f(ratio)` gradient (unlike shaping mode's
+                    # detached-scalar approximation).
+                    # Read hint_reg config from batch.meta_info (set by trainer)
+                    # rather than self.config, because FSDPActorConfig dataclass
+                    # rejects unknown fields.
+                    hint_reg_cfg = data.meta_info.get("hint_reg", None) if hasattr(data, "meta_info") else None
+                    hint_reg_mask = model_inputs.get("hint_reg_mask", None)
+                    if (
+                        hint_reg_cfg is not None
+                        and hint_reg_cfg.get("enabled", False)
+                        and hint_reg_mask is not None
+                    ):
+                        mask = hint_reg_mask.to(log_prob.dtype)
+                        denom = mask.sum().clamp_min(1.0)
+                        hr_clip_eps = float(hint_reg_cfg.get("clip_eps", 0.2))
+                        hr_gamma = float(hint_reg_cfg.get("gamma", 0.1))
+                        hr_input_type = str(hint_reg_cfg.get("input_type", "ratio"))
+                        # `input_type` selects what f() is applied to:
+                        #   "ratio" (default): f(ratio) where ratio = π_θ(y|x)/π_θ_start(y|x, e)
+                        #                      Uses full IS ratio; SDPO paper's improvement.
+                        #   "raw_p":            f(p) where p = π_θ(y|x)  (LUFFY paper's original form)
+                        #                      No denominator; matches LUFFY exactly.
+                        # In both cases, gradient flows through the shape via log_prob.
+                        if hr_input_type == "raw_p":
+                            hr_val = torch.exp(torch.clamp(log_prob, min=-10.0, max=10.0))
+                        elif hr_input_type == "ratio":
+                            hr_val = torch.exp(
+                                torch.clamp(log_prob - old_log_prob.detach(), min=-10.0, max=10.0)
+                            )
+                        else:
+                            raise ValueError(
+                                f"unknown hint_reg.input_type={hr_input_type!r}, "
+                                f"expected 'ratio' or 'raw_p'"
+                            )
+                        val_capped = torch.minimum(
+                            hr_val, torch.full_like(hr_val, 1.0 + hr_clip_eps)
+                        )
+                        objective = val_capped / (val_capped + hr_gamma)
+                        hint_reg_loss = -(objective * mask).sum() / denom
+                        hint_reg_coef = float(hint_reg_cfg.get("coef", 1.0))
+                        policy_loss = policy_loss + hint_reg_coef * hint_reg_loss
+                        micro_batch_metrics["actor/hint_reg_loss"] = float(hint_reg_loss.detach().item())
+                        micro_batch_metrics["actor/hint_reg_mask_frac"] = float(
+                            mask.sum().item() / max(1.0, response_mask.sum().item())
+                        )
+
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
