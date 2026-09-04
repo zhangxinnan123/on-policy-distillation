@@ -93,9 +93,12 @@ aopd is the best 1.7B run (+2.13) and the worst 4B run (−4.00).
 | **tent** τ=1.6 | `rk2s5yn2` | 98.0 | 60.83 / 76.22 | 40.83 / 60.23 | 47.08 / 62.56 | 81.88 / 90.79 | **57.66 / 72.45** | −2.29 |
 | **opdt4** v0.5 cov0.1 eps5 | `1y6vjzlq` | 99.4 | 59.58 / 79.77 | 41.67 / 62.31 | 52.08 / 71.56 | 85.31 / 94.06 | **59.66 / 76.92** | −0.29 |
 | **opdt4** v0.3 cov0.1 eps5 tp0.95 | `d0rp7mbi` | 98.8 | 54.58 / 72.81 | 41.25 / 62.42 | 50.00 / 67.23 | 84.06 / 95.36 | **57.47 / 74.46** | −2.48 |
-| **opdt4** v0.3 cov0.1 eps0.5 tp0.95 ‡ | `j4ik04uj` | 89.7 | 54.58 / 71.04 | 43.75 / 70.08 | 51.67 / 71.27 | 80.94 / 93.47 | **57.73 / 76.46** | +0.91 |
+| **opdt4** v0.3 cov0.1 eps0.5 tp0.95 | `j4ik04uj` | 89.3 | 52.08 / 74.39 | 38.33 / 60.19 | 51.25 / 67.26 | 85.00 / 96.32 | **56.67 / 74.54** | **−3.28** |
 
-‡ job 16187, **still running** — step-84 reading, not a final result.
+`j4ik04uj` is the **worst 8B run** and the only one that *falls* on its last step
+(57.73 → 56.67). The other four all jump on step 100: baseline 56.82 → 59.95, `1y6vjzlq`
+57.55 → 59.66, aopd 57.42 → 60.60, tent 57.71 → 57.66. Quoting its step-80 value (57.73,
+which an earlier revision of this file did) would have inverted its rank.
 
 aopd gives the **highest 8B mean@8 of any run (60.60)** but costs 4.08pp of pass@8, so it is a
 mean/pass trade, not a clean win — and +0.65 is inside the noise floor anyway. tent's −2.29 is
@@ -377,13 +380,17 @@ Sorted by FKL share, with Δ against each student's own baseline:
 | 3.7% | 1.7B eps5 v0.5 | +1.17 |
 | 4.5% | 1.7B eps10 | +0.62 |
 | 6.4% | 1.7B eps5 tp0.95 | +0.86 |
-| 10.3% | 8B eps0.5 tp0.95 ‡ | +0.91 |
+| 10.7% | 8B eps0.5 tp0.95 | **−3.28** |
 | 16.5% | 4B eps0.5 tp0.95 | −0.60 |
 | 18.0% | 4B eps0.5 | −0.03 |
 | 22.5% | 1.7B eps0.5 tp0.95 | +0.16 |
 
-Grouping: FKL < 7% averages **+0.08**, FKL > 10% averages **−0.65**. The 0.73pp gap is smaller
-than every noise floor here, so even that weak ordering is not established.
+Grouping: FKL < 7% averages **+0.08**, FKL > 10% averages **−1.19**. With the sweep complete the
+high-FKL group is uniformly the worst opdt4 setting *within each student*: 1.7B +0.16, 4B −0.60,
+8B −3.28. On 8B the ordering is monotone in FKL share — 0.6% → −0.29, 1.2% → −2.48,
+10.7% → −3.28 — which is the opposite of what "route more where the teacher disagrees" predicts.
+Individual gaps still mostly sit inside the noise floors, but the sign is consistent across all
+three students, which the earlier partial data did not show.
 
 **The decisive point is what "low FKL" means.** At 0.6% FKL, 99.4% of tokens take exactly the
 baseline k1 path, so opdt4's best results are the ones where it barely intervenes — they are
@@ -403,10 +410,6 @@ So the difference is not *how many* tokens reach the FKL arm but *which*:
 
 A per-token, post-hoc criterion works; a per-position, distribution-shape criterion does not.
 Any further work on this router should change the criterion, not its thresholds.
-
-‡ still running at the time of writing (step 84 of 100).
-
----
 
 **Size-matched opdt4 trio** — identical mask settings (`vote=0.5, cov=0.1, eps_low=5`) across all
 three SFT students, so the set isolates student size. All log **online** to wandb (verified
