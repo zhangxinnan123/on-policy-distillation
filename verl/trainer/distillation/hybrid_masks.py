@@ -112,6 +112,29 @@ def _mask_adv_threshold(ctx: HybridMaskContext) -> torch.Tensor:
     return ctx.k1_per_token.abs() > threshold
 
 
+@register_mask("aopd")
+def _mask_aopd(ctx: HybridMaskContext) -> torch.Tensor:
+    """AOPD (Advantage-guided OPD): FKL when A<0, PG when A>=0.
+
+    A = log π_T(u) − log π_S(u), so A < 0 means the student assigns higher
+    probability to the sampled token than the teacher does — the classic
+    "overconfident wrong" regime, where REINFORCE-RKL tends to push the
+    student further from the teacher (learn worse). Route those positions
+    to the supervised (FKL) arm so gradients come from teacher's full
+    top-k distribution instead of a single overconfident sample.
+
+    ctx.k1_per_token stores log π_S(u) − log π_T(u) = −A. So:
+        A >= threshold  ⟺  −k1 >= threshold  ⟺  k1 <= −threshold  → PG (True)
+        A <  threshold  ⟺                          k1 >  −threshold  → FKL (False)
+
+    Strategy kwargs:
+      threshold (float, default 0.0): A cutoff. Default 0.0 means A<0 → FKL,
+        A>=0 → PG. Set >0 to be more conservative (more FKL routing).
+    """
+    threshold = float(ctx.mask_kwargs.get("threshold", 0.0))
+    return (-ctx.k1_per_token) >= threshold
+
+
 @register_mask("teacher_conf")
 def _mask_teacher_conf(ctx: HybridMaskContext) -> torch.Tensor:
     """PG where teacher's top-1 probability is below a threshold (low confidence).
@@ -1031,5 +1054,125 @@ def _mask_opd_theory_guided2(ctx: HybridMaskContext) -> torch.Tensor:
     if use_sampled_saturation_rule:
         ctx.extras["opd_sampled_overshoot_mask"] = sampled_overshoot
     ctx.extras["opd_fkl_vote"] = fkl_vote
+
+    return pg_mask
+
+
+@register_mask("opd_theory_guided4")
+def _mask_opd_theory_guided4(ctx: HybridMaskContext) -> torch.Tensor:
+    """
+    Theory-guided OPD routing (v4): two rules — coverage + M3 teacher-prob vote.
+
+    Return:
+        pg_mask: (B, T)  True -> PG/RKL update, False -> FKL update
+
+    Both rules ask the same question at different granularities: can a single-sample
+    RKL/PG update actually deliver the mass the teacher wants? The PG lift amplitude
+    on a candidate c is O(pi_S(c)) by the softmax Jacobian, so mass the student does
+    not already hold is unreachable by RKL and needs a dense FKL signal.
+
+      R1 (coverage): student mass on the teacher's top-p nucleus
+              cov = sum_{c in teacher nucleus} pi_S(c)          in [0, 1]
+          Fires FKL when cov < coverage_threshold. Position-level, no per-candidate
+          detail: the student simply is not on the teacher's support.
+
+      R2 (M3, per-candidate low coverage with a teacher-prob-weighted vote):
+              per-candidate  pi_T(c) / pi_S(c) > 1 + eps_low
+              vote = sum_{c: fires, c in nucleus} pi_T(c) / sum_{c in nucleus} pi_T(c)
+          Fires FKL when vote > fkl_vote_threshold. Weighting by pi_T(c) means a
+          candidate only counts in proportion to how much the teacher actually
+          wants it, so one negligible under-covered tail token cannot flip the
+          position. Catches the case where cov is adequate in aggregate but is
+          concentrated on the wrong members of the nucleus.
+
+      fkl_position = R1 or R2
+
+    Dropped relative to opd_theory_guided3 / earlier v4: the per-candidate
+    direction-conflict rule (M2), the sampled-saturation rule (M1), the
+    reverse-coverage rule, and the hard-A override. The hard-A override was
+    additionally unreachable: losses.py clamps k1_per_token to +/-loss_max_clamp
+    (10.0 in every launch script) before the mask runs, so A < -10.0 was never true.
+
+    Both rules are computed inline from student_topk_probs and teacher_topk_logprobs
+    on one shared nucleus definition, so ctx.coverage_scores (which applies its own
+    top_p inside the logit processor) is deliberately not used — teacher_top_p here
+    governs both rules.
+
+    Strategy kwargs:
+      eps_low (0.5),                      -- R2 per-candidate pi_T/pi_S ratio margin,
+      teacher_top_p (0.9),                -- nucleus for both rules,
+      coverage_threshold (0.2),           -- R1: student mass on nucleus below this -> FKL,
+      fkl_vote_threshold (0.3),           -- R2 teacher-prob vote cutoff,
+      prob_floor (1e-6),
+      use_coverage_rule / use_low_coverage_rule (both True) -- ablation toggles.
+    """
+    if ctx.student_topk_probs is None:
+        raise ValueError(
+            "opd_theory_guided4 requires student_topk_probs in HybridMaskContext "
+            "(FSDP backend only; populated by compute_forward_kl_topk)."
+        )
+
+    # ----------------- Hyperparameters --------------------------------
+    eps_low = float(ctx.mask_kwargs.get("eps_low", 0.5))
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
+    coverage_threshold = float(ctx.mask_kwargs.get("coverage_threshold", 0.2))
+    fkl_vote_threshold = float(ctx.mask_kwargs.get("fkl_vote_threshold", 0.3))
+    prob_floor = float(ctx.mask_kwargs.get("prob_floor", 1e-6))
+
+    use_coverage_rule = bool(ctx.mask_kwargs.get("use_coverage_rule", True))
+    use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+
+    r_low = 1.0 + eps_low
+
+    # ----------------- Inputs -----------------------------------------
+    pi_c = ctx.student_topk_probs                    # (B, T, K) student prob at teacher top-k ids
+    teacher_probs = ctx.teacher_topk_logprobs.exp()  # (B, T, K)
+
+    # ----------------- Teacher nucleus (shared by both rules) ---------
+    shifted_cumsum = torch.cat(
+        [
+            torch.zeros_like(teacher_probs[..., :1]),
+            teacher_probs.cumsum(dim=-1)[..., :-1],
+        ],
+        dim=-1,
+    )
+    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K), top-1 always True
+
+    fkl_position = torch.zeros(
+        pi_c.shape[:2], dtype=torch.bool, device=pi_c.device
+    )  # (B, T)
+
+    # ----------------- R1: student mass on teacher top-p --------------
+    student_mass_on_teacher_topp = (pi_c * teacher_candidate.float()).sum(dim=-1)  # (B, T)
+    coverage_low = torch.zeros_like(fkl_position)
+    if use_coverage_rule:
+        coverage_low = student_mass_on_teacher_topp < coverage_threshold
+        fkl_position = fkl_position | coverage_low
+
+    # ----------------- R2: M3 per-candidate vote, teacher-prob weighted
+    pi_c_safe = pi_c.clamp_min(prob_floor)
+    pi_T_safe = teacher_probs.clamp_min(prob_floor)
+    low_student_coverage = (pi_T_safe / pi_c_safe) > r_low  # (B, T, K)
+    need_fkl_per_c = low_student_coverage & teacher_candidate
+
+    fkl_mass = (teacher_probs * need_fkl_per_c.float()).sum(dim=-1)                       # (B, T)
+    total_mass = (teacher_probs * teacher_candidate.float()).sum(dim=-1).clamp_min(1e-8)  # (B, T)
+    fkl_vote = fkl_mass / total_mass                                                      # (B, T)
+    vote_high = torch.zeros_like(fkl_position)
+    if use_low_coverage_rule:
+        vote_high = fkl_vote > fkl_vote_threshold
+        fkl_position = fkl_position | vote_high
+
+    pg_mask = ~fkl_position
+
+    # ----------------- Diagnostics ------------------------------------
+    # Each logged mask is the signal that actually routed, so firing rates sum
+    # (with overlap) to the FKL fraction.
+    ctx.extras["opd_student_mass_on_teacher_topp"] = student_mass_on_teacher_topp
+    ctx.extras["opd_fkl_vote"] = fkl_vote
+    if use_coverage_rule:
+        ctx.extras["opd_coverage_low_mask"] = coverage_low
+    if use_low_coverage_rule:
+        ctx.extras["opd_low_coverage_mask"] = vote_high
 
     return pg_mask

@@ -131,3 +131,13 @@ log
 outputs
 .history
 lzy_eval_result
+recipe/update_consistency/figures
+# Generated rollouts and eval artifacts (1.3G / 173M) -- regenerate from the scripts instead
+data/sft_gen
+eval_vis
+plot/figures
+__pycache__/
+*.pyc
+
+# 462 MB SFT corpus; rebuild with opd_inference/convert_to_llamafactory.py
+LlamaFactory/data/opd_sft_10k.json

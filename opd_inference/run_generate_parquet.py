@@ -19,6 +19,8 @@ def _worker(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    top_k: int,
+    min_p: float,
     n: int,
     dtype: str,
     conversations: List[List[Dict[str, str]]],
@@ -31,7 +33,14 @@ def _worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     llm = LLM(model=model, tensor_parallel_size=1, max_model_len=max_model_len, dtype=dtype)
-    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature, top_p=top_p, n=n)
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        n=n,
+    )
 
     print(f"[GPU {gpu_id}] generating {len(conversations)} prompts ...")
     outputs: List[Any] = llm.chat(
@@ -50,6 +59,8 @@ def _worker(
                     "ground_truth": (item.get("reward_model") or {}).get("ground_truth"),
                     "prompt": item.get("prompt"),
                     "response": getattr(comp, "text", "") or "",
+                    "finish_reason": getattr(comp, "finish_reason", None),
+                    "num_tokens": len(getattr(comp, "token_ids", None) or []),
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     print(f"[GPU {gpu_id}] done → {tmp_path}")
@@ -65,6 +76,8 @@ def main() -> None:
     p.add_argument("--max_new_tokens", type=int, default=16384, help="Max new tokens.")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.7)
+    p.add_argument("--top_k", type=int, default=-1, help="vLLM top_k (-1 disables).")
+    p.add_argument("--min_p", type=float, default=0.0, help="vLLM min_p (0 disables).")
     p.add_argument("--n", type=int, default=1, help="Number of generations per prompt.")
     p.add_argument(
         "--tp",
@@ -134,7 +147,12 @@ def main() -> None:
         # Single worker path
         llm = LLM(model=args.model, tensor_parallel_size=tp, max_model_len=args.max_model_len, dtype=args.dtype)
         sampling_params = SamplingParams(
-            max_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p, n=args.n
+            max_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            n=args.n,
         )
         print(f"[INFO] Generating {limit} prompts × n={args.n} (enable_thinking={args.enable_thinking}) ...")
         outputs: List[Any] = llm.chat(
@@ -153,6 +171,8 @@ def main() -> None:
                         "ground_truth": (item.get("reward_model") or {}).get("ground_truth"),
                         "prompt": item.get("prompt"),
                         "response": getattr(comp, "text", "") or "",
+                        "finish_reason": getattr(comp, "finish_reason", None),
+                        "num_tokens": len(getattr(comp, "token_ids", None) or []),
                     }
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
     else:
@@ -175,7 +195,7 @@ def main() -> None:
                 target=_worker,
                 args=(
                     gid, args.model, args.max_model_len, args.max_new_tokens,
-                    args.temperature, args.top_p, args.n, args.dtype,
+                    args.temperature, args.top_p, args.top_k, args.min_p, args.n, args.dtype,
                     chunks[w], indices[w], chunk_items[w], tmp_paths[w],
                     chat_template_kwargs or None,
                 ),

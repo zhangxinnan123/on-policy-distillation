@@ -1,0 +1,48 @@
+# SFT config for LlamaFactory
+# Train Qwen3-4B-Base to match Qwen3-8B thinking-mode responses on OpenThoughts3-math.
+# Dataset: opd_sft_10k (100k rollouts once 14720 completes; using 10k for now).
+
+### model
+model_name_or_path: Qwen/Qwen3-4B-Base
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: opd_sft_10k
+template: qwen3
+cutoff_len: 16384
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /fsx/xinnanzh/checkpoints/sft_qwen3_4b_thinking_10k
+logging_steps: 5
+save_steps: 200
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: wandb
+run_name: sft_qwen3_4b_thinking_10k
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+### eval (optional, disabled here)
+# val_size: 0.05
+# eval_strategy: steps
+# eval_steps: 200

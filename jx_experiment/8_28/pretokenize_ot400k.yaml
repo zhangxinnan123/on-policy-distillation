@@ -1,0 +1,44 @@
+### model
+# Use 1.7B (small) — just want to trigger tokenization to save cache.
+# The tokenizer is identical across Qwen3 sizes.
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+enable_liger_kernel: true
+packing: true
+neat_packing: true
+flash_attn: fa2
+
+### dataset
+dataset: opd_sft_400k_suffix
+template: qwen3
+cutoff_len: 20000
+overwrite_cache: true
+preprocessing_num_workers: 16
+tokenized_path: /fsx/xinnanzh/.tokenized/opd_sft_400k_suffix_qwen3_20k
+dataloader_persistent_workers: false
+dataloader_pin_memory: false
+dataloader_num_workers: 0
+
+### output
+output_dir: /fsx/xinnanzh/checkpoints/_pretokenize_dummy
+logging_steps: 1
+save_steps: 999999
+save_total_limit: 1
+plot_loss: false
+report_to: none
+run_name: pretokenize_ot400k
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+# just enough to trigger cache save then exit
+max_steps: 2
+lr_scheduler_type: constant
+bf16: true
+ddp_timeout: 180000000

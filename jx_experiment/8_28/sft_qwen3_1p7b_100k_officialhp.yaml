@@ -1,0 +1,47 @@
+### model
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+enable_liger_kernel: true
+packing: true
+neat_packing: true
+flash_attn: fa2
+
+### dataset
+# OUR 100k n=8 data (already has the boxed suffix), reusing its tokenized cache.
+# Same data as sft_qwen3_1p7b_thinking_100k (LR 1e-5 / bs 128 -> 76.4% loop);
+# only the hyperparameters change, so this isolates LR/batch-size from dataset.
+dataset: opd_sft_100k
+template: qwen3
+cutoff_len: 20000
+overwrite_cache: false
+preprocessing_num_workers: 16
+tokenized_path: /fsx/xinnanzh/.tokenized/opd_sft_100k_qwen3_20k
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
+dataloader_num_workers: 4
+
+### output
+output_dir: /fsx/xinnanzh/checkpoints/sft_qwen3_1p7b_100k_officialhp
+logging_steps: 5
+save_strategy: steps
+save_steps: 50
+save_total_limit: 2
+plot_loss: true
+report_to: wandb
+run_name: sft_qwen3_1p7b_100k_officialhp
+
+### train
+# Exactly the official openthinker3 recipe: 8 x 8 x 8 GPUs = 512.
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 8
+learning_rate: 8.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
