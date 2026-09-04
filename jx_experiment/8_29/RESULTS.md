@@ -361,7 +361,84 @@ percentile threshold would hold the ratio constant.
 
 ---
 
-## 4. In flight
+## 4. Cross-cutting analysis
+
+### The noise floor is wider per-step than at the final step
+
+The headline floor (1.07pp @1.7B, 1.63pp @4B) is the spread of the three identical repeats at
+**step 100**. Computing it at every validation step instead:
+
+| step | 4B repeat spread | 1.7B repeat spread |
+|---|---|---|
+| 20 | 1.04 | 1.56 |
+| 40 | **2.11** | 0.63 |
+| 60 | 1.04 | 0.68 |
+| 80 | 0.96 | 1.19 |
+| 100 | 1.64 | 1.07 |
+
+So **any mid-training comparison at 4B has to clear ~2.1pp**, not 1.63pp. 8B has no repeats at
+all, and its baseline moves 3.23pp between steps 20 and 40 (58.07 → 54.84) and 3.13pp between 80
+and 100 (56.82 → 59.95) within a single run — so on 8B nothing under ~3pp is interpretable.
+
+### Peak values, and why they are not usable
+
+Taking each run's best validation step rather than its last, with the baseline read at the *same*
+step:
+
+| student | best opdt4 | peak | step | baseline @same | Δ | best aopd peak |
+|---|---|---|---|---|---|---|
+| 1.7B | eps5 tp0.95 `sl8wjf53` | 22.94 | 80 | 19.92 | **+3.02** | **22.99** @100 |
+| 4B | eps10 `umu7p78g` | 51.82 | 60 | 50.36 | +1.46 | 50.70 @60 |
+| 8B | eps5 v0.5 `1y6vjzlq` | 59.66 | 100 | 59.95 | −0.29 | **60.60** @100 |
+
+Three caveats make these unusable as results:
+
+1. **Only the 1.7B peak clears its floor.** +3.02 vs 1.07pp. The 4B +1.46 is under that size's
+   2.1pp per-step floor; the 8B best is negative.
+2. **Peaks sit at step 60–80 and do not hold.** 1.7B 22.94 → 21.72, 4B 51.82 → 50.94,
+   8B 58.80 → 57.47. And **every run in this file uses `save_freq=-1`**, so the weights that
+   produced those peaks were never written to disk — they cannot be recovered or shipped.
+3. **The peak step is set by data order, not by method.** With `data.shuffle=False` all runs of a
+   size see identical batches in identical order, so they move together: every 1.7B run dips at
+   step 40 and every 4B run peaks at step 60. Comparing peak-to-peak across methods compares
+   which method happened to be highest on the same favourable batch.
+
+### aopd vs the best opdt4, step by step
+
+Δ = aopd − opdt4, so positive means aopd ahead:
+
+| step | 1.7B | 4B | 8B |
+|---|---|---|---|
+| 20 | +0.31 | +0.36 | +0.83 |
+| 40 | +0.42 | **+2.89** | +1.59 |
+| 60 | +0.55 | −1.12 | +1.85 |
+| 80 | −0.57 | −0.23 | −0.13 |
+| 100 | **+1.28** | **−4.14** | +0.94 |
+
+**aopd leads in 10 of 15 comparisons** and its peak is higher at 1.7B and 8B. Its one clear loss
+is the 4B final step, and that comes from a single-step collapse rather than sustained weakness:
+`zyt1z46m` runs 47.99 / 49.38 / 50.70 / 50.60 / **46.80**, i.e. it is at or above baseline for
+80 steps and then drops 3.80pp, ending below even the SFT start (47.00). It is the only 4B run
+that falls on its last step. With one run per setting there is no way to tell whether that
+collapse is systematic or a one-off, which is the single most useful thing a repeat would settle.
+
+### A step-80 coincidence worth not over-reading
+
+At step 80 on 1.7B, three hybrid runs land within 0.57pp of each other while their FKL shares
+differ by 5x:
+
+| run | FKL% | avg 4 @80 | Δ baseline |
+|---|---|---|---|
+| `sl8wjf53` opdt4 eps5 tp0.95 | 6.4 | 22.94 | +3.02 |
+| `zo9tt461` opdt4 eps10 | 4.1 | 22.40 | +2.48 |
+| `6a38xpb4` aopd | 32.7 | 22.37 | +2.45 |
+
+That invites the reading "the gain comes from the `k1_pg_fkl_topk` loss mode, not from the mask."
+**It does not survive the other two sizes**: at 4B the same three-way spread at step 80 is
+−0.68 to +1.27 with no common sign, and the corresponding 1.7B final values diverge again
+(22.99 / 21.48 / 21.72). The cheap test would be one run with `hybrid_mask_strategy=all` under
+`k1_pg_fkl_topk` — all-PG routing, same loss mode. If it also reads +2.5 at step 80, the mask is
+irrelevant at 1.7B. **That control has not been run.**
 
 ### The `opd_theory_guided4` sweep is finished, and the family does not work
 
@@ -411,42 +488,20 @@ So the difference is not *how many* tokens reach the FKL arm but *which*:
 A per-token, post-hoc criterion works; a per-position, distribution-shape criterion does not.
 Any further work on this router should change the criterion, not its thresholds.
 
-**Size-matched opdt4 trio** — identical mask settings (`vote=0.5, cov=0.1, eps_low=5`) across all
-three SFT students, so the set isolates student size. All log **online** to wandb (verified
-reachable from a compute node), so no post-hoc sync is needed.
+**Size-matched opdt4 trio** (jobs 16033/16034/16035, then re-run as 16164–16167 and
+16185–16187): identical mask settings across all three SFT students, logged **online** to wandb.
+All finished; their numbers are in the per-size tables above. Two operational notes from that
+batch:
 
-| job | student | run | nodes | pg% | status |
-|---|---|---|---|---|---|
-| 16034 | 1.7B SFT | `bp1y00pz` | 2 | — | running, 79% |
-| 16035 | 4B SFT | `yhm6ynir` | 1 | 98.5 | running, 55% (47.61 @step 55) |
-| 16033 | 8B SFT | `1y6vjzlq` | 2 | 99.2 | running, 43% (55.13 @step 42) |
+- `WANDB_MODE=online` makes wandb init a hard dependency. Job 16164 died after 45 minutes with
+  `Run initialization has timed out after 90.0 sec` before running a step. The submit scripts now
+  set `WANDB_INIT_TIMEOUT=600`.
+- Every single-node script had `ppo_max_token_len_per_gpu` at the full 18432 while also setting
+  `SP=2`, which discards the point of Ulysses — each rank packs 18432 tokens of activations
+  instead of 9216. That thin margin killed job 16035 (4B) in `loss.backward()` at step 59, short
+  by 0.34 GiB, and `xglsupnb` (1.7B) at step 32. Halving it to 9216 let **8B run the real hybrid
+  loss on a single node**, which previously required the 2-node resource-pool recipe.
 
-Why this setting: aopd (pg 67.3) is the only 1.7B result above the noise floor while being the
-worst 4B result at nearly the same routing fraction, and every high-pg% setting tried at 1.7B
-(tent 96.6, opdt4 eps10 95.5) sat inside the floor. `eps_low=5` lands between those regimes.
-16033 is also the first opdt4 run on the 8B SFT student at all.
-
-> **The premise was wrong: `eps_low=5` does not keep R2 firing.** Measured pg% on the trio is
-> **98.6 → 99.2 @8B** (`1y6vjzlq`) and **98.5 @4B** (`yhm6ynir`), i.e. ~1% of tokens reach the FKL
-> arm — the same near-inert regime as `eps_low=10` (95.5–99.5%). Combined with `vote=0.5` (a
-> higher vote threshold is *harder* to trigger), the FKL arm barely fires, so all three runs are
-> approximately the baseline with extra cost. Confirmed by `171sfne3`: `eps_low=5` at 8B-Base also
-> reads 99.4%.
->
-> To actually exercise the router, the next sweep needs a much smaller `eps_low` (≤1, i.e. ratio
-> > 2, versus the current > 6) and/or a lower `vote`. For reference, aopd — the only setting that
-> beat the noise floor anywhere — runs at pg 67–76%, so ~25–33% FKL is the regime worth targeting.
-
-Unrelated, also running:
-
-Both of the previous batch have now **finished** and are folded into the tables above:
-
-| job | run | what | outcome |
-|---|---|---|---|
-| 15921 | `umu7p78g` | 4B SFT opdt4 vote0.3 eps_low=10 | 50.94 / 68.79 (+0.14, noise) |
-| 16032 | `171sfne3` | 8B-Base opdt4 vote0.3 eps_low=5 | 30.08 / 44.74, stayed healthy (3.9% clip) |
-
----
 
 ## Caveat 1: rope_theta
 
