@@ -1176,3 +1176,133 @@ def _mask_opd_theory_guided4(ctx: HybridMaskContext) -> torch.Tensor:
         ctx.extras["opd_low_coverage_mask"] = vote_high
 
     return pg_mask
+
+@register_mask("opd_theory_guided5")
+def _mask_opd_theory_guided5(ctx: HybridMaskContext) -> torch.Tensor:
+    """
+    Theory-guided OPD routing (v5): two-sided per-candidate mismatch over the teacher nucleus.
+
+    Return:
+        pg_mask: (B, T)  True -> PG/RKL update, False -> FKL update
+
+    v4 only routes where the student *under*-covers a nucleus candidate. v5 adds the mirror
+    case -- the student *over*-shoots one -- because both are states in which the sampled-token
+    update is a poor instrument, just for different reasons:
+
+      under-coverage  pi_T(c) / pi_S(c) > ratio_low
+          The teacher wants mass the student does not hold. A single-sample PG lift on c has
+          amplitude O(pi_S(c)) by the softmax Jacobian, so mass the student lacks is
+          effectively unreachable and needs the dense FKL signal.
+
+      over-confidence pi_S(c) / pi_T(c) > ratio_high      (ANY candidate, not a vote)
+          The student concentrates far more mass on c than the teacher wants. One badly
+          overshot nucleus member already means the position's distribution is wrong in a way
+          the teacher disagrees with, so a single mismatched candidate is enough to route.
+          v4's docstring argues overshoot is "slow but recoverable" under RKL and drops it;
+          v5 exists to test that claim rather than assume it.
+
+      R1 (coverage), unchanged from v4:
+              sum_{c in nucleus} pi_S(c) < coverage_threshold  ->  FKL
+
+      fkl_position = R1 or vote(under-coverage) or any(over-confidence)
+
+    **Threshold convention differs from v4 on purpose.** v4 tests `> 1 + eps_low`, so
+    `eps_low=0.5` means a ratio of 1.5 and `eps_low=10` means 11 -- a repeated source of
+    confusion when reading its runs. v5 takes the ratios directly: `ratio_low` and
+    `ratio_high` ARE the ratios. `ratio_low=10` means `pi_T/pi_S > 10`. Launch scripts may
+    still carry these in shell variables named HYBRID_MASK_EPS_LOW / _HIGH, but the value
+    passed is the ratio.
+
+    Strategy kwargs:
+      ratio_low (1.5),                   -- under-coverage ratio, teacher-prob-weighted vote,
+      ratio_high (3.0),                  -- over-confidence ratio, ANY-candidate,
+      overshoot_floor (0.5),             -- R3 also needs pi_S(c) above this absolute mass,
+      teacher_top_p (0.9),               -- nucleus for all rules,
+      coverage_threshold (0.2),          -- R1,
+      fkl_vote_threshold (0.3),          -- vote cutoff for the under-coverage side,
+      prob_floor (1e-6),
+      use_coverage_rule (True),          -- R1 toggle,
+      use_low_coverage_rule (True),      -- under-coverage toggle,
+      use_overconfident_rule (True).     -- over-confidence toggle (the v5 addition).
+    """
+    if ctx.student_topk_probs is None:
+        raise ValueError(
+            "opd_theory_guided5 requires student_topk_probs in HybridMaskContext "
+            "(FSDP backend only; populated by compute_forward_kl_topk)."
+        )
+
+    ratio_low = float(ctx.mask_kwargs.get("ratio_low", 1.5))
+    ratio_high = float(ctx.mask_kwargs.get("ratio_high", 3.0))
+    teacher_top_p = float(ctx.mask_kwargs.get("teacher_top_p", 0.9))
+    coverage_threshold = float(ctx.mask_kwargs.get("coverage_threshold", 0.2))
+    fkl_vote_threshold = float(ctx.mask_kwargs.get("fkl_vote_threshold", 0.3))
+    prob_floor = float(ctx.mask_kwargs.get("prob_floor", 1e-6))
+
+    use_coverage_rule = bool(ctx.mask_kwargs.get("use_coverage_rule", True))
+    use_low_coverage_rule = bool(ctx.mask_kwargs.get("use_low_coverage_rule", True))
+    use_overconfident_rule = bool(ctx.mask_kwargs.get("use_overconfident_rule", True))
+    # Absolute-mass floor for R3, following the sampled_overshoot_floor (0.5) that the v1/v3
+    # high-side rule pairs with its ratio test. Without it a ratio of 3 fires on pi_S=0.003 vs
+    # pi_T=0.001 -- negligible mass either way -- and under ANY-over-K semantics that noise
+    # would trigger almost every position. A floor >= 0.5 also means at most one candidate can
+    # qualify (probabilities sum to 1), so "ANY" collapses to "the dominant candidate".
+    overshoot_floor = float(ctx.mask_kwargs.get("overshoot_floor", 0.5))
+
+    pi_c = ctx.student_topk_probs                    # (B, T, K)
+    teacher_probs = ctx.teacher_topk_logprobs.exp()  # (B, T, K)
+
+    shifted_cumsum = torch.cat(
+        [
+            torch.zeros_like(teacher_probs[..., :1]),
+            teacher_probs.cumsum(dim=-1)[..., :-1],
+        ],
+        dim=-1,
+    )
+    teacher_candidate = shifted_cumsum < teacher_top_p  # (B, T, K), top-1 always True
+
+    fkl_position = torch.zeros(pi_c.shape[:2], dtype=torch.bool, device=pi_c.device)
+
+    # ----------------- R1: student mass on teacher top-p --------------
+    student_mass_on_teacher_topp = (pi_c * teacher_candidate.float()).sum(dim=-1)
+    coverage_low = torch.zeros_like(fkl_position)
+    if use_coverage_rule:
+        coverage_low = student_mass_on_teacher_topp < coverage_threshold
+        fkl_position = fkl_position | coverage_low
+
+    pi_c_safe = pi_c.clamp_min(prob_floor)
+    pi_T_safe = teacher_probs.clamp_min(prob_floor)
+
+    # ----------------- Under-coverage: teacher-prob-weighted vote -----
+    under = (pi_T_safe / pi_c_safe) > ratio_low
+    need_fkl_per_c = under & teacher_candidate
+    fkl_mass = (teacher_probs * need_fkl_per_c.float()).sum(dim=-1)
+    total_mass = (teacher_probs * teacher_candidate.float()).sum(dim=-1).clamp_min(1e-8)
+    fkl_vote = fkl_mass / total_mass
+    vote_high = torch.zeros_like(fkl_position)
+    if use_low_coverage_rule:
+        vote_high = fkl_vote > fkl_vote_threshold
+        fkl_position = fkl_position | vote_high
+
+    # ----------------- Over-confidence: ANY candidate -----------------
+    over = ((pi_c_safe / pi_T_safe) > ratio_high) & (pi_c > overshoot_floor)
+    over_high = torch.zeros_like(fkl_position)
+    if use_overconfident_rule:
+        over_high = (over & teacher_candidate).any(dim=-1)
+        fkl_position = fkl_position | over_high
+
+    pg_mask = ~fkl_position
+
+    # ----------------- Diagnostics ------------------------------------
+    ctx.extras["opd_student_mass_on_teacher_topp"] = student_mass_on_teacher_topp
+    ctx.extras["opd_fkl_vote"] = fkl_vote
+    if use_coverage_rule:
+        ctx.extras["opd_coverage_low_mask"] = coverage_low
+    if use_low_coverage_rule:
+        ctx.extras["opd_low_coverage_mask"] = vote_high
+    if use_overconfident_rule:
+        # Reuses the key losses.py:323 already exports as opd_high_coverage_ratio -- the v1/v3
+        # masks use it for exactly this "student over-shoots the teacher" signal, so v5's R3
+        # stays comparable with theirs. A new key would be silently dropped.
+        ctx.extras["opd_high_coverage_mask"] = over_high
+
+    return pg_mask

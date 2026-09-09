@@ -320,6 +320,14 @@ def _emit_topk_diagnostics(
                 metrics["distillation/opd_low_coverage_ratio"] = Metric(
                     AggregationType.MEAN, low_coverage_mask.sum().float() / total
                 )
+            if "opd_coverage_low_mask" in mask_extras:
+                # R1 of opd_theory_guided4/5. Never exported before: those masks write
+                # "opd_coverage_low_mask" while only "opd_low_coverage_mask" (R2) was read,
+                # so R1's firing rate was invisible in every run recorded so far.
+                coverage_low_mask = mask_extras["opd_coverage_low_mask"] & response_mask_bool
+                metrics["distillation/opd_coverage_low_ratio"] = Metric(
+                    AggregationType.MEAN, coverage_low_mask.sum().float() / total
+                )
             if "opd_high_coverage_mask" in mask_extras:
                 high_coverage_mask = mask_extras["opd_high_coverage_mask"] & response_mask_bool
                 metrics["distillation/opd_high_coverage_ratio"] = Metric(

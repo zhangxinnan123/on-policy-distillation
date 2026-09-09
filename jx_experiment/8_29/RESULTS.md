@@ -503,6 +503,68 @@ batch:
   loss on a single node**, which previously required the 2-node resource-pool recipe.
 
 
+---
+
+## 5. Base-student runs added 9/7-9/8
+
+Results only. `FKL%` = `1 - pg_token_ratio` at the final step; `clip%` =
+`response_length/clip_ratio`. Common: non-think, response 4096, val 8192, 200 steps,
+`save_freq=-1`, single node, SP=2, teacher Qwen3-8B.
+
+> **Validation sampling differs from §2.** These runs use `val_kwargs` T=**1.0**,
+> top_p=**0.8**, top_k=**-1**, max_tokens=**8192**. The §2 SFT-student runs use T=0.6,
+> top_p=0.95, top_k=20, max_tokens=16384 (the header of this file quotes only the latter).
+> Absolute scores are therefore **not comparable across §2 and §3/§5**; within-section
+> comparisons are unaffected.
+
+### 5.1 opdt4 rule ablation (jobs 16306-16314)
+
+All nine arms share `vote0.3, cov0.2, eps_low=0.5` (i.e. ratio 1.5), `tp0.9`; only
+`use_coverage_rule` (R1) and `use_low_coverage_rule` (R2) differ.
+
+| student | arm | run | FKL% | clip% | reslen | aime24 | aime25 | aime26 | amc23 | **avg 4** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1.7B-Base | R1 only | `wax160ad` | 0.4 | 13.3 | 1968 | 9.17 / 18.65 | 5.00 / 12.39 | 5.83 / 14.76 | 43.44 / 71.23 | **15.86 / 29.26** |
+| 1.7B-Base | R2 only | `c80t9beh` | 16.7 | 17.2 | 2009 | 10.00 / 24.67 | 6.67 / 20.09 | 7.92 / 19.72 | 41.56 / 69.30 | **16.54 / 33.45** |
+| 1.7B-Base | R1+R2 | `9svfzh75` | 17.6 | 11.7 | 1982 | 9.17 / 20.36 | 7.50 / 15.89 | 7.92 / 17.22 | 40.00 / 66.93 | **16.15 / 30.10** |
+| 4B-Base | R1 only | `ahqlvg3u` | 0.2 | 6.2 | 1589 | 17.50 / 27.05 | 18.75 / 30.93 | 12.50 / 23.14 | 58.44 / 82.47 | **26.80 / 40.89** |
+| 4B-Base | R2 only | `9svxar9q` | 10.2 | 8.6 | 1651 | 19.17 / 29.98 | 18.33 / 33.89 | 13.33 / 20.69 | 53.75 / 78.91 | **26.15 / 40.87** |
+| 4B-Base | R1+R2 | `nhp06lsf` | 10.4 | 7.0 | 1667 | 18.33 / 31.85 | 16.67 / 24.26 | 15.42 / 25.03 | 58.44 / 78.56 | **27.21 / 39.92** |
+| 8B-Base | R1 only | `9vsbom2w` | 0.4 | 100.0 | 4096 | 19.58 / 32.65 | 16.25 / 23.00 | 14.17 / 27.19 | 60.00 / 83.45 | **27.50 / 41.57** |
+| 8B-Base | R2 only | `50uvp9br` | 8.0 | 7.0 | 1540 | 20.42 / 36.02 | 17.92 / 32.83 | 18.33 / 27.73 | 63.12 / 83.35 | **29.95 / 44.98** |
+| 8B-Base | R1+R2 | `j8iethth` | 6.5 | 98.4 | 4065 | 21.67 / 36.44 | 16.25 / 26.12 | 15.00 / 28.06 | 58.13 / 82.92 | **27.76 / 43.39** |
+
+### 5.2 `forward_kl_topk` — the 100% FKL endpoint (jobs 16303-16305)
+
+Non-hybrid loss mode, so no mask is consulted and `FKL%` is not defined from the
+routing diagnostic.
+
+| student | arm | run | FKL% | clip% | reslen | aime24 | aime25 | aime26 | amc23 | **avg 4** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1.7B-Base | forward_kl_topk | `ymy4w9jb` | 0.0 | 21.9 | 2420 | 8.75 / 18.86 | 5.00 / 15.95 | 7.92 / 12.12 | 42.81 / 70.00 | **16.12 / 29.23** |
+| 4B-Base | forward_kl_topk | `5bwnvzd7` | 0.0 | 91.4 | 4019 | 19.17 / 35.58 | 15.83 / 29.45 | 10.42 / 16.69 | 55.94 / 81.57 | **25.34 / 40.82** |
+| 8B-Base | forward_kl_topk † | `m8z01xzd` | 0.0 | 67.2 | 3569 | 18.75 / 30.37 | 17.50 / 29.78 | 12.08 / 26.87 | 56.25 / 81.68 | **26.15 / 42.18** |
+
+† job 16305 stopped at step 110 of 200; partial reading, not a final result.
+
+### 5.3 opdt5 rule ablation (jobs 16330-16335)
+
+New mask `opd_theory_guided5`. R3 = over-confidence: `pi_S(c)/pi_T(c) > ratio_high`
+**and** `pi_S(c) > overshoot_floor`, for ANY candidate in the teacher nucleus. Config
+`ratio_low=10, ratio_high=3.0, overshoot_floor=0.9, vote0.3, tp0.9`; R1 off in all arms.
+**v5 thresholds are raw ratios, not `1 + eps`** — v4's `eps_low=0.5` is ratio 1.5.
+`R2%` / `R3%` are the per-rule firing rates `opd_low_coverage_ratio` /
+`opd_high_coverage_ratio`.
+
+| student | arm | run | FKL% | R2% | R3% | clip% | aime24 | aime25 | aime26 | amc23 | **avg 4** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.7B-Base | R2 only | `wg1b8x8y` | 2.2 | 2.2 | - | 11.7 | 10.83 / 17.78 | 7.50 / 20.10 | 7.50 / 15.88 | 38.75 / 63.85 | **16.15 / 29.40** |
+| 1.7B-Base | R3 only | `v83ud8z7` | 0.2 | - | 0.2 | 93.0 | 10.00 / 20.65 | 7.92 / 15.13 | 5.42 / 12.84 | 37.50 / 64.65 | **15.21 / 28.32** |
+| 1.7B-Base | R2+R3 | `n8tombx4` | 2.1 | 2.1 | 0.2 | 11.7 | 10.00 / 19.74 | 7.50 / 16.38 | 6.25 / 15.26 | 37.19 / 65.02 | **15.23 / 29.10** |
+| 4B-Base | R2 only | `kt015jfl` | 0.7 | 0.7 | - | 11.7 | 17.50 / 28.49 | 16.67 / 31.53 | 11.25 / 19.26 | 57.19 / 82.89 | **25.65 / 40.54** |
+| 4B-Base | R3 only | `i12rsmgi` | 0.1 | - | 0.1 | 97.7 | 16.25 / 32.57 | 17.08 / 29.95 | 10.00 / 23.49 | 54.37 / 79.82 | **24.43 / 41.46** |
+| 4B-Base | R2+R3 | `tggkvw1b` | 0.7 | 0.7 | 0.1 | 7.8 | 15.83 / 27.94 | 16.67 / 33.73 | 13.75 / 23.77 | 55.94 / 78.95 | **25.55 / 41.10** |
+
 ## Caveat 1: rope_theta
 
 Training env transformers 5.2.0 nests `rope_theta` under `rope_parameters`; inference env
