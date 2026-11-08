@@ -47,6 +47,11 @@ MAX_NUM_TOKENS=$(( MAX_PROMPT + VAL_MAX_RESPONSE_LENGTH + 1 ))
 # tensor is (batched tokens x 151k vocab): sizing it by an 8192 val length
 # (10241 tokens) OOMed the teacher at step 192 once responses grew (11-08).
 TEACHER_MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
+# Per-step prefill chunk for the teacher (chunked prefill is on). Its fp32
+# prompt-logprob log_softmax is chunk x 151k x 4B (+ a copy): 6145 tokens still
+# OOMed at step 192 (11-08 07:03, 2.66 GiB alloc with 26.5 GiB in use), 2048
+# keeps that peak ~1.2 GiB. Only throughput changes, not the logprobs.
+TEACHER_MAX_BATCHED_TOKENS="${TEACHER_MAX_BATCHED_TOKENS:-2048}"
 MAX_NUM_SEQS=128
 TRAIN_PROMPT_BSZ=128
 
@@ -177,7 +182,7 @@ DISTILLATION=(
     distillation.teacher_model.inference.gpu_memory_utilization=$TEACHER_GPU_MEM_UTIL
     distillation.teacher_model.inference.enforce_eager=$ENFORCE_EAGER
     distillation.teacher_model.inference.max_model_len=$TEACHER_MAX_NUM_TOKENS
-    distillation.teacher_model.inference.max_num_batched_tokens=$TEACHER_MAX_NUM_TOKENS
+    distillation.teacher_model.inference.max_num_batched_tokens=$TEACHER_MAX_BATCHED_TOKENS
     distillation.teacher_model.inference.max_num_seqs=$MAX_NUM_SEQS
     distillation.distillation_loss.loss_mode=$DISTILLATION_LOSS_MODE
     distillation.distillation_loss.topk=$DISTILLATION_TOPK
@@ -263,7 +268,11 @@ TRAINER=(
     trainer.nnodes=1
     trainer.save_freq=${SAVE_FREQ:--1}
     trainer.test_freq=$TEST_FREQ
-    trainer.total_epochs=2
+    # Must cover TOTAL_STEPS: 12452 train prompts // 128 = 97 batches/epoch, so 2
+    # epochs ended the loop silently at step 194 with no step-200 val/ckpt
+    # (11-08, three times; looked like an external SIGTERM). total_training_steps
+    # is the real stop.
+    trainer.total_epochs=${TOTAL_EPOCHS:-10}
     trainer.val_before_train=$VAL_BEFORE_TRAIN
     trainer.use_legacy_worker_impl=disable
     trainer.resume_mode=${RESUME_MODE:-disable}
