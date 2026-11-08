@@ -42,6 +42,11 @@ MAX_RESPONSE_LENGTH=4096
 # sized once.
 VAL_MAX_RESPONSE_LENGTH="${VAL_MAX_RESPONSE_LENGTH:-4096}"   # TTS offline eval uses 8192
 MAX_NUM_TOKENS=$(( MAX_PROMPT + VAL_MAX_RESPONSE_LENGTH + 1 ))
+# The teacher only scores TRAINING rollouts (prompt + MAX_RESPONSE_LENGTH), so its
+# limits follow the training length, never the val length. Its prompt-logprob
+# tensor is (batched tokens x 151k vocab): sizing it by an 8192 val length
+# (10241 tokens) OOMed the teacher at step 192 once responses grew (11-08).
+TEACHER_MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
 MAX_NUM_SEQS=128
 TRAIN_PROMPT_BSZ=128
 
@@ -171,8 +176,8 @@ DISTILLATION=(
     distillation.teacher_model.inference.name=$ROLLOUT_NAME
     distillation.teacher_model.inference.gpu_memory_utilization=$TEACHER_GPU_MEM_UTIL
     distillation.teacher_model.inference.enforce_eager=$ENFORCE_EAGER
-    distillation.teacher_model.inference.max_model_len=$MAX_NUM_TOKENS
-    distillation.teacher_model.inference.max_num_batched_tokens=$MAX_NUM_TOKENS
+    distillation.teacher_model.inference.max_model_len=$TEACHER_MAX_NUM_TOKENS
+    distillation.teacher_model.inference.max_num_batched_tokens=$TEACHER_MAX_NUM_TOKENS
     distillation.teacher_model.inference.max_num_seqs=$MAX_NUM_SEQS
     distillation.distillation_loss.loss_mode=$DISTILLATION_LOSS_MODE
     distillation.distillation_loss.topk=$DISTILLATION_TOPK
